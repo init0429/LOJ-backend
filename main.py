@@ -3,7 +3,12 @@ from pydantic import BaseModel
 import redis
 import json
 import uuid
+from supabase import create_client, Client
 import os
+
+url: str = os.environ.get("SUPABASE_URL")
+key: str = os.environ.get("SUPABASE_KEY")
+supabase: Client = create_client(url, key)
 
 app = FastAPI()
 
@@ -24,6 +29,14 @@ async def submit_code(submission: Submission):
     {"input": "10 20\n", "output": "30"},
     {"input": "-5 5\n", "output": "0"},
   ]
+
+  supabase.table("submissions").insert({
+    "id": submission_id,
+    "problem_id": submission.problem_id,
+    "language": submission.language,
+    "code": submission.code,
+    "status": "Pending"
+  }).execute()
 
   task_data = {
     "submission_id": submission_id,
