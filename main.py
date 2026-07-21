@@ -19,11 +19,18 @@ class Submission(BaseModel):
 async def submit_code(submission: Submission):
   submission_id = str(uuid.uuid4())
 
+  dummy_test_cases = [
+    {"input": "1 2\n", "output": "3"},
+    {"input": "10 20\n", "output": "30"},
+    {"input": "-5 5\n", "output": "0"},
+  ]
+
   task_data = {
     "submission_id": submission_id,
     "problem_id": submission.problem_id,
     "language": submission.language,
-    "code": submission.code
+    "code": submission.code,
+    "test_cases": dummy_test_cases
   }
 
   r.rpush("submission_queue", json.dumps(task_data))
