@@ -1,7 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Literal
+from typing import Literal, Optional
 import redis
 import json
 import uuid
@@ -9,7 +9,9 @@ import asyncio
 from supabase import create_client, Client
 import os
 
-SupportedLanguage = Literal["python", "cpp", "java"]
+# judge/worker.py의 LANGUAGES와 반드시 동기화해서 유지할 것.
+# 여기서 막아두면 judge까지 안 가고 API 단에서 바로 422로 거절됨.
+SupportedLanguage = Literal["python", "c", "cpp", "java", "sql"]
 
 url: str = os.environ.get("SUPABASE_URL", "")
 key: str = os.environ.get("SUPABASE_KEY", "")
@@ -17,6 +19,7 @@ supabase: Client = create_client(url, key)
 
 app = FastAPI(title="LOJ Backend API", version="1.0.0")
 
+# CORS - 개발 환경에서는 localhost만 허용
 allowed_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -33,19 +36,46 @@ app.add_middleware(
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 r = redis.from_url(redis_url)
 
+
+async def get_current_user_id(authorization: Optional[str] = Header(None)) -> str:
+    """
+    프론트에서 보내는 `Authorization: Bearer <supabase access_token>`을 검증해서
+    user_id를 뽑아낸다. /submit, /test_run 둘 다 이걸 통과해야 호출 가능함
+    (로그인 안 한 사람이 채점 서버 자원을 그냥 쓰는 걸 막기 위함이기도 함).
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+
+    token = authorization.removeprefix("Bearer ").strip()
+
+    try:
+        user_response = supabase.auth.get_user(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="유효하지 않거나 만료된 토큰입니다.")
+
+    user = getattr(user_response, "user", None)
+    if user is None:
+        raise HTTPException(status_code=401, detail="유효하지 않거나 만료된 토큰입니다.")
+
+    return user.id
+
+
+
 class Submission(BaseModel):
     problem_id: int
     language: SupportedLanguage
     code: str
+    contest_id: Optional[int] = None  # 콘테스트 중 제출이면 채워짐
 
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
 
 @app.post("/submit")
-async def submit_code(submission: Submission):
+async def submit_code(submission: Submission, user_id: str = Depends(get_current_user_id)):
     submission_id = str(uuid.uuid4())
 
+    # DB에서 테스트케이스 조회
     try:
         response = (
             supabase.table("test_cases")
@@ -60,6 +90,7 @@ async def submit_code(submission: Submission):
         ]
 
         if not test_cases:
+            # DB에 없는 경우 더미로 폴백
             test_cases = [
                 {"input": "1 2\n", "output": "3"},
                 {"input": "10 20\n", "output": "30"},
@@ -75,6 +106,8 @@ async def submit_code(submission: Submission):
             "language": submission.language,
             "code": submission.code,
             "status": "Pending",
+            "user_id": user_id,
+            "contest_id": submission.contest_id,
         }).execute()
     except Exception as e:
         return {"status": "error", "message": f"제출 기록 실패: {str(e)}"}
@@ -96,7 +129,7 @@ async def submit_code(submission: Submission):
     }
 
 @app.post("/test_run")
-async def test_code(submission: Submission):
+async def test_code(submission: Submission, user_id: str = Depends(get_current_user_id)):
     test_id = str(uuid.uuid4())
 
     try:
