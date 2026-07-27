@@ -19,11 +19,11 @@ supabase: Client = create_client(url, key)
 
 app = FastAPI(title="LOJ Backend API", version="1.0.0")
 
-# CORS - 개발 환경에서는 localhost만 허용
+_extra_origins = os.getenv("ALLOWED_ORIGINS", "")
 allowed_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-]
+] + [o.strip() for o in _extra_origins.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
