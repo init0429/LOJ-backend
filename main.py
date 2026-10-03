@@ -13,7 +13,10 @@ import os
 
 # judge/worker.py의 LANGUAGES와 반드시 동기화해서 유지할 것.
 # 여기서 막아두면 judge까지 안 가고 API 단에서 바로 422로 거절됨.
-SupportedLanguage = Literal["python", "c", "cpp", "java", "sql"]
+SupportedLanguage = Literal[
+    "python", "c", "cpp", "java", "sql",
+    "javascript", "typescript", "ruby", "php", "perl",
+]
 
 url: str = os.environ.get("SUPABASE_URL", "")
 key: str = os.environ.get("SUPABASE_KEY", "")

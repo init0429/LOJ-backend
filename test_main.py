@@ -29,6 +29,13 @@ class SubmissionTests(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 main.Submission(**(self.payload.model_dump() | values))
 
+    def test_new_languages_are_accepted(self):
+        for language in ("javascript", "typescript", "ruby", "php", "perl"):
+            with self.subTest(language=language):
+                self.assertEqual(main.Submission(problem_id=1, language=language, code="code").language, language)
+        with self.assertRaises(ValidationError):
+            main.Submission(problem_id=1, language="unknown", code="code")
+
     def test_missing_problem_is_not_judged(self):
         self.query.execute.return_value = SimpleNamespace(data=[])
         with self.assertRaises(HTTPException) as caught:
