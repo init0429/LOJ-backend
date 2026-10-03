@@ -1,11 +1,13 @@
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import Literal, Optional
 import redis
 import json
 import uuid
-import asyncio
+import time
+import logging
+from datetime import datetime, timezone
 from supabase import create_client, Client
 import os
 
@@ -34,10 +36,11 @@ app.add_middleware(
 )
 
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-r = redis.from_url(redis_url)
+r = redis.from_url(redis_url, socket_connect_timeout=5, socket_timeout=5)
+logger = logging.getLogger(__name__)
 
 
-async def get_current_user_id(authorization: Optional[str] = Header(None)) -> str:
+def get_current_user_id(authorization: Optional[str] = Header(None)) -> str:
     """
     프론트에서 보내는 `Authorization: Bearer <supabase access_token>`을 검증해서
     user_id를 뽑아낸다. /submit, /test_run 둘 다 이걸 통과해야 호출 가능함
@@ -62,42 +65,58 @@ async def get_current_user_id(authorization: Optional[str] = Header(None)) -> st
 
 
 class Submission(BaseModel):
-    problem_id: int
+    problem_id: int = Field(gt=0)
     language: SupportedLanguage
-    code: str
-    contest_id: Optional[int] = None  # 콘테스트 중 제출이면 채워짐
+    code: str = Field(min_length=1, max_length=100_000)
+    contest_id: Optional[int] = Field(default=None, gt=0)
+
+    @field_validator("code")
+    @classmethod
+    def nonempty_code(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Code must not be blank")
+        return value
+
+
+def load_test_cases(submission: Submission, public_only: bool = False):
+    try:
+        problem = supabase.table("problems").select("id").eq("id", submission.problem_id).execute()
+        if not problem.data:
+            raise HTTPException(404, "문제를 찾을 수 없습니다.")
+        if submission.contest_id is not None:
+            contests = supabase.table("contests").select("start_time, end_time").eq("id", submission.contest_id).execute()
+            if not contests.data:
+                raise HTTPException(404, "콘테스트를 찾을 수 없습니다.")
+            contest = contests.data[0]
+            start = datetime.fromisoformat(contest["start_time"].replace("Z", "+00:00"))
+            end = datetime.fromisoformat(contest["end_time"].replace("Z", "+00:00"))
+            if not start <= datetime.now(timezone.utc) < end:
+                raise HTTPException(409, "콘테스트 진행 시간에만 실행하거나 제출할 수 있습니다.")
+            links = supabase.table("contest_problems").select("problem_id").eq("contest_id", submission.contest_id).eq("problem_id", submission.problem_id).execute()
+            if not links.data:
+                raise HTTPException(400, "콘테스트에 포함되지 않은 문제입니다.")
+        query = supabase.table("test_cases").select("input_data, expected_output").eq("problem_id", submission.problem_id)
+        if public_only:
+            query = query.eq("is_hidden", False)
+        response = query.order("id").execute()
+        if not response.data:
+            raise HTTPException(422, "실행 가능한 테스트케이스가 없습니다.")
+        return [{"input": tc["input_data"], "output": tc["expected_output"]} for tc in response.data]
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to load judging context")
+        raise HTTPException(503, "채점 정보를 불러오지 못했습니다. 잠시 후 다시 시도하세요.")
 
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
 
 @app.post("/submit")
-async def submit_code(submission: Submission, user_id: str = Depends(get_current_user_id)):
+def submit_code(submission: Submission, user_id: str = Depends(get_current_user_id)):
     submission_id = str(uuid.uuid4())
 
-    # DB에서 테스트케이스 조회
-    try:
-        response = (
-            supabase.table("test_cases")
-            .select("input_data, expected_output")
-            .eq("problem_id", submission.problem_id)
-            .order("id")
-            .execute()
-        )
-        test_cases = [
-            {"input": tc["input_data"] + "\n", "output": tc["expected_output"]}
-            for tc in response.data
-        ]
-
-        if not test_cases:
-            # DB에 없는 경우 더미로 폴백
-            test_cases = [
-                {"input": "1 2\n", "output": "3"},
-                {"input": "10 20\n", "output": "30"},
-                {"input": "-5 5\n", "output": "0"},
-            ]
-    except Exception as e:
-        return {"status": "error", "message": f"테스트케이스 조회 실패: {str(e)}"}
+    test_cases = load_test_cases(submission)
 
     try:
         supabase.table("submissions").insert({
@@ -109,8 +128,9 @@ async def submit_code(submission: Submission, user_id: str = Depends(get_current
             "user_id": user_id,
             "contest_id": submission.contest_id,
         }).execute()
-    except Exception as e:
-        return {"status": "error", "message": f"제출 기록 실패: {str(e)}"}
+    except Exception:
+        logger.exception("Failed to insert submission")
+        raise HTTPException(503, "제출을 기록하지 못했습니다. 다시 시도하세요.")
 
     task_data = {
         "submission_id": submission_id,
@@ -120,7 +140,15 @@ async def submit_code(submission: Submission, user_id: str = Depends(get_current
         "test_cases": test_cases,
     }
 
-    r.rpush("submission_queue", json.dumps(task_data))
+    try:
+        r.rpush("submission_queue", json.dumps(task_data))
+    except redis.RedisError:
+        logger.exception("Failed to enqueue submission %s", submission_id)
+        try:
+            supabase.table("submissions").update({"status": "System Error"}).eq("id", submission_id).execute()
+        except Exception:
+            logger.exception("Failed to mark submission as failed %s", submission_id)
+        raise HTTPException(503, "채점 서버에 연결하지 못했습니다. 잠시 후 다시 제출하세요.")
 
     return {
         "submission_id": submission_id,
@@ -129,27 +157,10 @@ async def submit_code(submission: Submission, user_id: str = Depends(get_current
     }
 
 @app.post("/test_run")
-async def test_code(submission: Submission, user_id: str = Depends(get_current_user_id)):
+def test_code(submission: Submission, user_id: str = Depends(get_current_user_id)):
     test_id = str(uuid.uuid4())
 
-    try:
-        response = (
-            supabase.table("test_cases")
-            .select("input_data, expected_output")
-            .eq("problem_id", submission.problem_id)
-            .eq("is_hidden", False)
-            .order("id")
-            .execute()
-        )
-        test_cases = [
-            {"input": tc["input_data"] + "\n", "output": tc["expected_output"]}
-            for tc in response.data
-        ]
-
-        if not test_cases:
-            return {"status": "error", "message": "테스트케이스가 없습니다."}
-    except Exception as e:
-        return {"status": "error", "message": f"테스트케이스 조회 실패: {str(e)}"}
+    test_cases = load_test_cases(submission, public_only=True)
 
     task_data = {
         "submission_id": test_id,
@@ -160,27 +171,24 @@ async def test_code(submission: Submission, user_id: str = Depends(get_current_u
         "test_cases": test_cases,
     }
 
-    pubsub = r.pubsub()
     channel_name = f"test_result:{test_id}"
-    pubsub.subscribe(channel_name)
-
-    r.rpush("submission_queue", json.dumps(task_data))
-
-    timeout = 15
-    start_time = asyncio.get_event_loop().time()
-    result = None
-
-    while asyncio.get_event_loop().time() - start_time < timeout:
-        message = pubsub.get_message(ignore_subscribe_messages=True)
-        if message:
-            result = json.loads(message["data"].decode("utf-8"))
-            break
-        await asyncio.sleep(0.1)
-
-    pubsub.unsubscribe(channel_name)
-    pubsub.close()
-
-    if result:
-        return {"status": "success", "result": result}
-    else:
-        return {"status": "error", "message": "채점 서버 응답 대기 시간이 초과되었습니다."}
+    try:
+        # Synchronous clients run in FastAPI's thread pool, not its event loop.
+        with r.pubsub() as pubsub:
+            pubsub.subscribe(channel_name)
+            r.rpush("submission_queue", json.dumps(task_data))
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                message = pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
+                if message:
+                    result = json.loads(message["data"])
+                    if not isinstance(result, dict) or not isinstance(result.get("status"), str):
+                        raise ValueError("Invalid judge response")
+                    return {"status": "success", "result": result}
+    except redis.RedisError:
+        logger.exception("Test-run queue unavailable")
+        raise HTTPException(503, "채점 서버에 연결하지 못했습니다.")
+    except (ValueError, TypeError):
+        logger.exception("Invalid test-run response")
+        raise HTTPException(502, "채점 서버에서 올바르지 않은 결과를 받았습니다.")
+    raise HTTPException(504, "채점 대기 시간이 초과되었습니다. 잠시 후 다시 실행하세요.")
