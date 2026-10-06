@@ -91,8 +91,14 @@ def load_test_cases(submission: Submission, public_only: bool = False):
             if not contests.data:
                 raise HTTPException(404, "콘테스트를 찾을 수 없습니다.")
             contest = contests.data[0]
-            start = datetime.fromisoformat(contest["start_time"].replace("Z", "+00:00"))
-            end = datetime.fromisoformat(contest["end_time"].replace("Z", "+00:00"))
+            def parse_dt(dt_str: str) -> datetime:
+                dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+
+            start = parse_dt(contest["start_time"])
+            end = parse_dt(contest["end_time"])
             if not start <= datetime.now(timezone.utc) < end:
                 raise HTTPException(409, "콘테스트 진행 시간에만 실행하거나 제출할 수 있습니다.")
             links = supabase.table("contest_problems").select("problem_id").eq("contest_id", submission.contest_id).eq("problem_id", submission.problem_id).execute()

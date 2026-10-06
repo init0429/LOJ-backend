@@ -60,6 +60,13 @@ class SubmissionTests(unittest.TestCase):
             main.load_test_cases(payload)
         self.assertEqual(caught.exception.status_code, 409)
 
+    def test_naive_datetime_contest_handling(self):
+        payload = self.payload.model_copy(update={"contest_id": 1})
+        self.query.execute.side_effect = [SimpleNamespace(data=[{"id": 1}]), SimpleNamespace(data=[{"start_time": "2000-01-01 00:00:00", "end_time": "2000-01-02 00:00:00"}])]
+        with self.assertRaises(HTTPException) as caught:
+            main.load_test_cases(payload)
+        self.assertEqual(caught.exception.status_code, 409)
+
     def test_unrelated_problem_rejected_for_contest(self):
         payload = self.payload.model_copy(update={"contest_id": 1})
         self.query.execute.side_effect = [SimpleNamespace(data=[{"id": 1}]), SimpleNamespace(data=[{"start_time": "2000-01-01T00:00:00Z", "end_time": "2999-01-01T00:00:00Z"}]), SimpleNamespace(data=[])]
