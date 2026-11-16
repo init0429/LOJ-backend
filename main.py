@@ -7,6 +7,7 @@ import json
 import uuid
 import time
 import logging
+import hashlib
 from datetime import datetime, timezone
 from supabase import create_client, Client
 import os
@@ -41,6 +42,42 @@ app.add_middleware(
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 r = redis.from_url(redis_url, socket_connect_timeout=5, socket_timeout=5)
 logger = logging.getLogger(__name__)
+
+# Shared Redis counters keep admission consistent across API processes.
+RATE_SCRIPT = """
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then redis.call('EXPIRE', KEYS[1], 60) end
+return count
+"""
+ENQUEUE_SCRIPT = """
+local count = redis.call('LLEN', KEYS[1])
+local bytes = 0
+for _, payload in ipairs(redis.call('LRANGE', KEYS[1], 0, -1)) do
+    bytes = bytes + string.len(payload)
+end
+if count >= 100 or bytes + string.len(ARGV[1]) > 16777216 then return 0 end
+redis.call('RPUSH', KEYS[1], ARGV[1])
+return 1
+"""
+
+
+def check_admission(user_id: str):
+    identity = hashlib.sha256(user_id.encode()).hexdigest()
+    try:
+        if r.eval(RATE_SCRIPT, 1, f"judge:rate:{identity}") > 10:
+            raise HTTPException(429, "Too many judging requests. Try again shortly.")
+        if r.llen("submission_queue") >= 100:
+            raise HTTPException(503, "Judging queue is full. Try again shortly.")
+    except redis.RedisError:
+        raise HTTPException(503, "Judging admission service unavailable.")
+
+
+def enqueue(task: dict):
+    payload = json.dumps(task)
+    if len(payload.encode("utf-8")) > 1048576:
+        raise HTTPException(422, "Judging payload exceeds the 1 MiB limit.")
+    if not r.eval(ENQUEUE_SCRIPT, 1, "submission_queue", payload):
+        raise HTTPException(503, "Judging queue is full. Try again shortly.")
 
 
 def get_current_user_id(authorization: Optional[str] = Header(None)) -> str:
@@ -117,6 +154,7 @@ async def health_check():
 
 @app.post("/submit")
 def submit_code(submission: Submission, user_id: str = Depends(get_current_user_id)):
+    check_admission(user_id)
     submission_id = str(uuid.uuid4())
 
     test_cases = load_test_cases(submission)
@@ -144,13 +182,15 @@ def submit_code(submission: Submission, user_id: str = Depends(get_current_user_
     }
 
     try:
-        r.rpush("submission_queue", json.dumps(task_data))
-    except redis.RedisError:
+        enqueue(task_data)
+    except (redis.RedisError, HTTPException) as exc:
         logger.exception("Failed to enqueue submission %s", submission_id)
         try:
             supabase.table("submissions").update({"status": "System Error"}).eq("id", submission_id).execute()
         except Exception:
             logger.exception("Failed to mark submission as failed %s", submission_id)
+        if isinstance(exc, HTTPException):
+            raise
         raise HTTPException(503, "채점 서버에 연결하지 못했습니다. 잠시 후 다시 제출하세요.")
 
     return {
@@ -161,6 +201,7 @@ def submit_code(submission: Submission, user_id: str = Depends(get_current_user_
 
 @app.post("/test_run")
 def test_code(submission: Submission, user_id: str = Depends(get_current_user_id)):
+    check_admission(user_id)
     test_id = str(uuid.uuid4())
 
     test_cases = load_test_cases(submission, public_only=True)
@@ -168,6 +209,7 @@ def test_code(submission: Submission, user_id: str = Depends(get_current_user_id
     task_data = {
         "submission_id": test_id,
         "is_test": True,
+        "expires_at": time.time() + 15,
         "problem_id": submission.problem_id,
         "language": submission.language,
         "code": submission.code,
@@ -179,7 +221,7 @@ def test_code(submission: Submission, user_id: str = Depends(get_current_user_id
         # Synchronous clients run in FastAPI's thread pool, not its event loop.
         with r.pubsub() as pubsub:
             pubsub.subscribe(channel_name)
-            r.rpush("submission_queue", json.dumps(task_data))
+            enqueue(task_data)
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 message = pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)

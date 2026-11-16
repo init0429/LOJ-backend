@@ -23,6 +23,9 @@ class SubmissionTests(unittest.TestCase):
         self.db_patch = patch.object(main, "supabase", self.db)
         self.db_patch.start()
         self.addCleanup(self.db_patch.stop)
+        self.admission_patch = patch.object(main, "check_admission")
+        self.admission_patch.start()
+        self.addCleanup(self.admission_patch.stop)
 
     def test_blank_code_and_invalid_ids_are_rejected(self):
         for values in ({"code": "  "}, {"problem_id": 0}, {"contest_id": -1}):
@@ -69,7 +72,7 @@ class SubmissionTests(unittest.TestCase):
 
     def test_queue_failure_marks_submission_failed(self):
         with patch.object(main, "load_test_cases", return_value=[]), patch.object(main, "r") as queue:
-            queue.rpush.side_effect = main.redis.ConnectionError("unavailable")
+            queue.eval.side_effect = main.redis.ConnectionError("unavailable")
             with self.assertRaises(HTTPException) as caught:
                 main.submit_code(self.payload, "user-1")
         self.assertEqual(caught.exception.status_code, 503)
@@ -77,7 +80,7 @@ class SubmissionTests(unittest.TestCase):
 
     def test_pubsub_is_closed_on_queue_failure(self):
         with patch.object(main, "load_test_cases", return_value=[]), patch.object(main, "r") as queue:
-            queue.rpush.side_effect = main.redis.ConnectionError("unavailable")
+            queue.eval.side_effect = main.redis.ConnectionError("unavailable")
             with self.assertRaises(HTTPException):
                 main.test_code(self.payload, "user-1")
             queue.pubsub.return_value.__exit__.assert_called_once()
