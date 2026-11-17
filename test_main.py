@@ -89,6 +89,21 @@ class SubmissionTests(unittest.TestCase):
 
 
 
+class ConfigurationTests(unittest.TestCase):
+    def reload_main(self, **env):
+        import importlib
+        with patch.dict(os.environ, env), patch("supabase.create_client"):
+            return importlib.reload(main)
+
+    def tearDown(self):
+        self.reload_main()
+
+    def test_missing_supabase_settings_stop_the_api_at_startup(self):
+        for missing in ("SUPABASE_URL", "SUPABASE_KEY"):
+            with self.subTest(missing=missing), self.assertRaisesRegex(RuntimeError, missing):
+                self.reload_main(**{missing: ""})
+
+
 class AuthenticationTests(unittest.TestCase):
     def authenticate(self, email, domains=frozenset()):
         user = SimpleNamespace(id="user-1", email=email)

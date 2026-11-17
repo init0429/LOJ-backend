@@ -21,9 +21,15 @@ SupportedLanguage = Literal[
     "javascript", "typescript", "ruby", "php", "perl",
 ]
 
-url: str = os.environ.get("SUPABASE_URL", "")
-key: str = os.environ.get("SUPABASE_KEY", "")
-supabase: Client = create_client(url, key)
+def required_env(name: str) -> str:
+    """빠지면 서버가 떠도 아무 요청도 처리하지 못하는 설정. 시작할 때 바로 알린다."""
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"환경 변수 {name}가 비어 있습니다. .env를 확인하세요 (.env.example 참고).")
+    return value
+
+
+supabase: Client = create_client(required_env("SUPABASE_URL"), required_env("SUPABASE_KEY"))
 
 app = FastAPI(title="LOJ Backend API", version="1.0.0")
 
