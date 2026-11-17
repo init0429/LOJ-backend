@@ -118,7 +118,11 @@ class Submission(BaseModel):
         return value
 
 
-def load_test_cases(submission: Submission, public_only: bool = False):
+def validate_judging_context(submission: Submission, public_only: bool = False):
+    """
+    채점을 큐에 넣기 전에 문제·콘테스트·테스트케이스가 유효한지 확인한다.
+    테스트 데이터 자체는 judge가 DB에서 직접 읽으므로 여기서는 존재 여부만 본다.
+    """
     try:
         problem = supabase.table("problems").select("id").eq("id", submission.problem_id).execute()
         if not problem.data:
@@ -135,13 +139,11 @@ def load_test_cases(submission: Submission, public_only: bool = False):
             links = supabase.table("contest_problems").select("problem_id").eq("contest_id", submission.contest_id).eq("problem_id", submission.problem_id).execute()
             if not links.data:
                 raise HTTPException(400, "콘테스트에 포함되지 않은 문제입니다.")
-        query = supabase.table("test_cases").select("input_data, expected_output").eq("problem_id", submission.problem_id)
+        query = supabase.table("test_cases").select("id").eq("problem_id", submission.problem_id)
         if public_only:
             query = query.eq("is_hidden", False)
-        response = query.order("id").execute()
-        if not response.data:
+        if not query.limit(1).execute().data:
             raise HTTPException(422, "실행 가능한 테스트케이스가 없습니다.")
-        return [{"input": tc["input_data"], "output": tc["expected_output"]} for tc in response.data]
     except HTTPException:
         raise
     except Exception:
@@ -157,7 +159,7 @@ def submit_code(submission: Submission, user_id: str = Depends(get_current_user_
     check_admission(user_id)
     submission_id = str(uuid.uuid4())
 
-    test_cases = load_test_cases(submission)
+    validate_judging_context(submission)
 
     try:
         supabase.table("submissions").insert({
@@ -178,7 +180,6 @@ def submit_code(submission: Submission, user_id: str = Depends(get_current_user_
         "problem_id": submission.problem_id,
         "language": submission.language,
         "code": submission.code,
-        "test_cases": test_cases,
     }
 
     try:
@@ -204,7 +205,7 @@ def test_code(submission: Submission, user_id: str = Depends(get_current_user_id
     check_admission(user_id)
     test_id = str(uuid.uuid4())
 
-    test_cases = load_test_cases(submission, public_only=True)
+    validate_judging_context(submission, public_only=True)
 
     task_data = {
         "submission_id": test_id,
@@ -213,7 +214,6 @@ def test_code(submission: Submission, user_id: str = Depends(get_current_user_id
         "problem_id": submission.problem_id,
         "language": submission.language,
         "code": submission.code,
-        "test_cases": test_cases,
     }
 
     channel_name = f"test_result:{test_id}"
