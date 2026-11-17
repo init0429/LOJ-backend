@@ -1,7 +1,9 @@
+import asyncio
+import json
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
 os.environ.setdefault("SUPABASE_KEY", "test-key")
@@ -85,12 +87,61 @@ class SubmissionTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 503)
         self.query.update.assert_called_once_with({"status": "System Error"})
 
+
+
+def fake_pubsub(messages=()):
+    """redis.asyncio의 PubSub처럼 async with로 쓰이고 get_message가 차례로 값을 돌려주는 대역."""
+    pubsub = MagicMock()
+    pubsub.__aenter__.return_value = pubsub
+    pubsub.subscribe = AsyncMock()
+    pubsub.get_message = AsyncMock(side_effect=list(messages) or None, return_value=None)
+    return pubsub
+
+
+class TestRunTests(unittest.TestCase):
+    def setUp(self):
+        self.payload = main.Submission(problem_id=1, language="python", code="print(1)")
+        for name in ("check_admission", "validate_judging_context"):
+            patcher = patch.object(main, name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_test(self, pubsub, **enqueue):
+        # pubsub()은 동기 메서드라 MagicMock을 직접 넘긴다 (patch가 고르는 AsyncMock이면 코루틴이 된다).
+        async_r = MagicMock()
+        async_r.pubsub.return_value = pubsub
+        with patch.object(main, "async_r", async_r), patch.object(main, "enqueue", **enqueue) as queued:
+            return asyncio.run(main.test_code(self.payload, "user-1")), queued
+
+    def test_result_is_returned_once_published(self):
+        result = {"status": "Accepted", "test_cases": []}
+        pubsub = fake_pubsub([None, {"data": json.dumps(result)}])
+        response, queued = self.run_test(pubsub)
+        self.assertEqual(response, {"status": "success", "result": result})
+        task = queued.call_args.args[0]
+        self.assertTrue(task["is_test"])
+        self.assertNotIn("test_cases", task)
+        # 구독이 먼저여야 빨리 끝난 채점 결과를 놓치지 않는다.
+        pubsub.subscribe.assert_awaited_once_with(f"test_result:{task['submission_id']}")
+        pubsub.__aexit__.assert_awaited_once()
+
     def test_pubsub_is_closed_on_queue_failure(self):
-        with patch.object(main, "validate_judging_context"), patch.object(main, "r") as queue:
-            queue.eval.side_effect = main.redis.ConnectionError("unavailable")
-            with self.assertRaises(HTTPException):
-                main.test_code(self.payload, "user-1")
-            queue.pubsub.return_value.__exit__.assert_called_once()
+        pubsub = fake_pubsub()
+        with self.assertRaises(HTTPException) as caught:
+            self.run_test(pubsub, side_effect=main.redis.ConnectionError("unavailable"))
+        self.assertEqual(caught.exception.status_code, 503)
+        pubsub.__aexit__.assert_awaited_once()
+
+    def test_malformed_result_is_a_bad_gateway(self):
+        for data in ("not json", json.dumps(["Accepted"]), json.dumps({"status": 1})):
+            with self.subTest(data=data), self.assertRaises(HTTPException) as caught:
+                self.run_test(fake_pubsub([{"data": data}]))
+            self.assertEqual(caught.exception.status_code, 502)
+
+    def test_silent_judge_times_out(self):
+        with patch.object(main, "TEST_RUN_TIMEOUT", 0.05), self.assertRaises(HTTPException) as caught:
+            self.run_test(fake_pubsub())
+        self.assertEqual(caught.exception.status_code, 504)
 
 
 if __name__ == "__main__":

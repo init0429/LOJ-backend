@@ -1,8 +1,10 @@
 from fastapi import FastAPI, Header, HTTPException, Depends
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from typing import Literal, Optional
 import redis
+import redis.asyncio
 import json
 import uuid
 import time
@@ -41,6 +43,10 @@ app.add_middleware(
 
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 r = redis.from_url(redis_url, socket_connect_timeout=5, socket_timeout=5)
+# 예제 실행은 결과를 기다리는 동안 스레드를 붙잡지 않도록 비동기 연결로 구독한다.
+async_r = redis.asyncio.from_url(redis_url, socket_connect_timeout=5, socket_timeout=5)
+# 예제 실행 결과를 기다리는 최대 시간(초). 프록시의 응답 제한(보통 30초)보다 짧게 둔다.
+TEST_RUN_TIMEOUT = 25
 logger = logging.getLogger(__name__)
 
 # Shared Redis counters keep admission consistent across API processes.
@@ -201,16 +207,18 @@ def submit_code(submission: Submission, user_id: str = Depends(get_current_user_
     }
 
 @app.post("/test_run")
-def test_code(submission: Submission, user_id: str = Depends(get_current_user_id)):
-    check_admission(user_id)
+async def test_code(submission: Submission, user_id: str = Depends(get_current_user_id)):
+    # 결과를 기다리는 동안은 이벤트 루프에서 쉬고, DB·Redis를 동기로 부르는 부분만
+    # 스레드 풀로 보낸다. 요청마다 스레드를 끝까지 붙잡으면 동시에 수십 명이 예제를
+    # 실행할 때 스레드 풀이 바닥나서 /submit까지 멈춘다.
+    await run_in_threadpool(check_admission, user_id)
+    await run_in_threadpool(validate_judging_context, submission, True)
     test_id = str(uuid.uuid4())
-
-    validate_judging_context(submission, public_only=True)
 
     task_data = {
         "submission_id": test_id,
         "is_test": True,
-        "expires_at": time.time() + 15,
+        "expires_at": time.time() + TEST_RUN_TIMEOUT,
         "problem_id": submission.problem_id,
         "language": submission.language,
         "code": submission.code,
@@ -218,13 +226,14 @@ def test_code(submission: Submission, user_id: str = Depends(get_current_user_id
 
     channel_name = f"test_result:{test_id}"
     try:
-        # Synchronous clients run in FastAPI's thread pool, not its event loop.
-        with r.pubsub() as pubsub:
-            pubsub.subscribe(channel_name)
-            enqueue(task_data)
-            deadline = time.monotonic() + 15
-            while time.monotonic() < deadline:
-                message = pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
+        async with async_r.pubsub() as pubsub:
+            await pubsub.subscribe(channel_name)
+            await run_in_threadpool(enqueue, task_data)
+            deadline = time.monotonic() + TEST_RUN_TIMEOUT
+            while (remaining := deadline - time.monotonic()) > 0:
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=min(remaining, 1.0),
+                )
                 if message:
                     result = json.loads(message["data"])
                     if not isinstance(result, dict) or not isinstance(result.get("status"), str):
