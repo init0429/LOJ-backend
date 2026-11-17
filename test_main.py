@@ -35,7 +35,7 @@ class SubmissionTests(unittest.TestCase):
                 main.Submission(**(self.payload.model_dump() | values))
 
     def test_new_languages_are_accepted(self):
-        for language in ("javascript", "typescript", "ruby", "php", "perl"):
+        for language in ("javascript", "typescript", "ruby", "php", "perl", "mysql"):
             with self.subTest(language=language):
                 self.assertEqual(main.Submission(problem_id=1, language=language, code="code").language, language)
         with self.assertRaises(ValidationError):
