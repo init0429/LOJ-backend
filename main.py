@@ -33,6 +33,15 @@ allowed_origins = [
     "http://127.0.0.1:3000",
 ] + [o.strip() for o in _extra_origins.split(",") if o.strip()]
 
+# 로그인 화면은 학교 계정만 고르게 하지만 그건 Google 화면의 안내일 뿐이라, 다른 Google
+# 계정으로 받은 토큰도 유효하다. 여기에 도메인을 적으면(쉼표로 여러 개) 그 계정만 채점을
+# 요청할 수 있다. 비워 두면 제한하지 않는다.
+ALLOWED_EMAIL_DOMAINS = {
+    domain.strip().lower().lstrip("@")
+    for domain in os.getenv("ALLOWED_EMAIL_DOMAINS", "").split(",")
+    if domain.strip()
+}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -105,6 +114,11 @@ def get_current_user_id(authorization: Optional[str] = Header(None)) -> str:
     user = getattr(user_response, "user", None)
     if user is None:
         raise HTTPException(status_code=401, detail="유효하지 않거나 만료된 토큰입니다.")
+
+    if ALLOWED_EMAIL_DOMAINS:
+        domain = (getattr(user, "email", None) or "").rpartition("@")[2].lower()
+        if domain not in ALLOWED_EMAIL_DOMAINS:
+            raise HTTPException(status_code=403, detail="학교 계정으로 로그인해야 이용할 수 있습니다.")
 
     return user.id
 

@@ -89,6 +89,35 @@ class SubmissionTests(unittest.TestCase):
 
 
 
+class AuthenticationTests(unittest.TestCase):
+    def authenticate(self, email, domains=frozenset()):
+        user = SimpleNamespace(id="user-1", email=email)
+        with patch.object(main, "supabase") as db, patch.object(main, "ALLOWED_EMAIL_DOMAINS", domains):
+            db.auth.get_user.return_value = SimpleNamespace(user=user)
+            return main.get_current_user_id("Bearer token")
+
+    def test_any_account_is_accepted_without_a_domain_list(self):
+        self.assertEqual(self.authenticate("someone@gmail.com"), "user-1")
+
+    def test_only_listed_domains_may_request_judging(self):
+        domains = {"bssm.hs.kr"}
+        self.assertEqual(self.authenticate("Student@BSSM.hs.kr", domains), "user-1")
+        for email in ("someone@gmail.com", "x@evil-bssm.hs.kr", "bssm.hs.kr@gmail.com", None):
+            with self.subTest(email=email), self.assertRaises(HTTPException) as caught:
+                self.authenticate(email, domains)
+            self.assertEqual(caught.exception.status_code, 403)
+
+    def test_missing_or_rejected_tokens_are_unauthorized(self):
+        with self.assertRaises(HTTPException) as caught:
+            main.get_current_user_id(None)
+        self.assertEqual(caught.exception.status_code, 401)
+        with patch.object(main, "supabase") as db:
+            db.auth.get_user.side_effect = RuntimeError("expired")
+            with self.assertRaises(HTTPException) as caught:
+                main.get_current_user_id("Bearer token")
+        self.assertEqual(caught.exception.status_code, 401)
+
+
 def fake_pubsub(messages=()):
     """redis.asyncio의 PubSub처럼 async with로 쓰이고 get_message가 차례로 값을 돌려주는 대역."""
     pubsub = MagicMock()
