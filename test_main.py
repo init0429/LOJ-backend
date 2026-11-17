@@ -103,6 +103,12 @@ class ConfigurationTests(unittest.TestCase):
             with self.subTest(missing=missing), self.assertRaisesRegex(RuntimeError, missing):
                 self.reload_main(**{missing: ""})
 
+    def test_configured_origins_replace_the_development_defaults(self):
+        self.assertEqual(self.reload_main(ALLOWED_ORIGINS="").allowed_origins,
+                         ["http://localhost:3000", "http://127.0.0.1:3000"])
+        self.assertEqual(self.reload_main(ALLOWED_ORIGINS="https://a.example, https://b.example").allowed_origins,
+                         ["https://a.example", "https://b.example"])
+
 
 class AuthenticationTests(unittest.TestCase):
     def authenticate(self, email, domains=frozenset()):

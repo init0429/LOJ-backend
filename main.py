@@ -33,11 +33,13 @@ supabase: Client = create_client(required_env("SUPABASE_URL"), required_env("SUP
 
 app = FastAPI(title="LOJ Backend API", version="1.0.0")
 
-_extra_origins = os.getenv("ALLOWED_ORIGINS", "")
+# 브라우저가 이 API를 직접 부를 때 허용할 출처. 지정하면 그 목록만 허용하고, 비워 두면
+# 개발용 프론트(localhost:3000)만 허용한다. 프론트가 같은 도메인의 /api로 부르면 필요 없다.
 allowed_origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-] + [o.strip() for o in _extra_origins.split(",") if o.strip()]
+    origin.strip()
+    for origin in (os.getenv("ALLOWED_ORIGINS") or "http://localhost:3000,http://127.0.0.1:3000").split(",")
+    if origin.strip()
+]
 
 # 로그인 화면은 학교 계정만 고르게 하지만 그건 Google 화면의 안내일 뿐이라, 다른 Google
 # 계정으로 받은 토큰도 유효하다. 여기에 도메인을 적으면(쉼표로 여러 개) 그 계정만 채점을
