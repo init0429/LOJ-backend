@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +16,7 @@ from datetime import datetime, timezone
 from supabase import create_client, Client
 import os
 
+import recommend
 import solvedac_client
 import solvedac_link
 import solvedac_tags
@@ -35,7 +38,20 @@ def required_env(name: str) -> str:
 
 supabase: Client = create_client(required_env("SUPABASE_URL"), required_env("SUPABASE_KEY"))
 
-app = FastAPI(title="LOJ Backend API", version="1.0.0")
+@contextlib.asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # solved.ac 연동 사용자의 통계를 밤마다 받는다(recommend.Recommender.run_nightly).
+    nightly = asyncio.create_task(recommender.run_nightly()) if recommender.can_sync else None
+    try:
+        yield
+    finally:
+        if nightly is not None:
+            nightly.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await nightly
+
+
+app = FastAPI(title="LOJ Backend API", version="1.0.0", lifespan=lifespan)
 
 # 브라우저가 이 API를 직접 부를 때 허용할 출처. 지정하면 그 목록만 허용하고, 비워 두면
 # 개발용 프론트(localhost:3000)만 허용한다. 프론트가 같은 도메인의 /api로 부르면 필요 없다.
@@ -141,13 +157,18 @@ _solvedac_store = solvedac_link.SupabaseTokenStore(supabase, _solvedac_cipher) i
 solvedac = solvedac_client.SolvedacClient.from_env(store=_solvedac_store, cache=async_r)
 if solvedac.configured and _solvedac_store is None:
     logger.warning("SOLVEDAC_TOKEN_KEY가 비어 있어 solved.ac 연동을 끕니다.")
+recommender = recommend.Recommender(client=solvedac, supabase=supabase, store=_solvedac_store, redis=async_r)
 app.include_router(solvedac_link.create_router(
     client=solvedac, store=_solvedac_store, redis=async_r, current_user=get_current_user_id,
+    # 연동을 마치면 추천에 쓸 통계를 바로 한 번 받는다.
+    on_linked=recommender.sync_user,
 ))
 # 관리자 화면의 태그·티어 자동 채우기와 태그 목록 받기. 앱 설정만 있으면 된다(토큰 불필요).
 app.include_router(solvedac_tags.create_router(
     client=solvedac, supabase=supabase, current_user=get_current_user_id,
 ))
+# 레벨에 맞는 문제 추천. solved.ac를 연동하지 않았어도 LOJ 기록만으로 동작한다.
+app.include_router(recommend.create_router(recommender=recommender, current_user=get_current_user_id))
 
 
 class Submission(BaseModel):

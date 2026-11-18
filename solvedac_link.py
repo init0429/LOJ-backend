@@ -24,11 +24,11 @@ import logging
 import os
 import secrets
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlencode, urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken, MultiFernet
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, RedirectResponse
 import redis.exceptions
@@ -180,10 +180,12 @@ def _binding_hash(binding: str) -> str:
 
 
 def create_router(*, client: sc.SolvedacClient, store: Optional[SupabaseTokenStore], redis,
-                  current_user: Callable) -> APIRouter:
+                  current_user: Callable,
+                  on_linked: Optional[Callable[[str], Awaitable[Any]]] = None) -> APIRouter:
     """
     client: solved.ac 클라이언트, store: 토큰 저장소(암호화 키가 없으면 None),
     redis: redis.asyncio 클라이언트, current_user: LOJ 로그인을 확인해 user_id를 주는 의존성.
+    on_linked: 연동을 마친 뒤 응답을 보내고 나서 부른다(추천용 통계를 바로 받아 두기).
     """
     router = APIRouter(prefix="/integrations/solvedac")
     enabled = client.configured and store is not None
@@ -258,7 +260,8 @@ def create_router(*, client: sc.SolvedacClient, store: Optional[SupabaseTokenSto
         return response
 
     @router.get("/callback")
-    async def callback(request: Request, state: str = "", code: str = "", error: str = ""):
+    async def callback(request: Request, background: BackgroundTasks,
+                       state: str = "", code: str = "", error: str = ""):
         if not enabled:
             return back_to_settings("unavailable")
         try:
@@ -296,6 +299,8 @@ def create_router(*, client: sc.SolvedacClient, store: Optional[SupabaseTokenSto
         # 같은 solved.ac 계정이어도 새 토큰에는 영향이 없다.
         await revoke_quietly(previous)
         logger.info("solved.ac 연동: %s -> %s", user_id, me["handle"])
+        if on_linked is not None:
+            background.add_task(on_linked, user_id)
         return back_to_settings("linked")
 
     @router.delete("")

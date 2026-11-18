@@ -116,8 +116,14 @@ class LinkFlowTests(unittest.TestCase):
         http = httpx.AsyncClient(base_url=sc.BASE_URL, transport=httpx.MockTransport(self.solvedac))
         store = self.store if store == "default" else store
         api = sc.SolvedacClient(config, store=store, http=http)
+        self.linked_users = []
+
+        async def on_linked(user_id):
+            self.linked_users.append(user_id)
+
         app = FastAPI()
-        app.include_router(sl.create_router(client=api, store=store, redis=self.redis, current_user=current_user))
+        app.include_router(sl.create_router(client=api, store=store, redis=self.redis, current_user=current_user,
+                                            on_linked=on_linked))
         return TestClient(app, base_url="https://loj.example", follow_redirects=False)
 
     def start(self, user="user-1", client=None):
@@ -171,6 +177,14 @@ class LinkFlowTests(unittest.TestCase):
         response = self.client.delete("/integrations/solvedac", headers={"x-test-user": "user-1"})
         self.assertEqual(response.json(), {"configured": True, "linked": False})
         self.assertEqual((self.solvedac.revoked, self.store.rows), ([refresh], {}))
+
+    def test_stats_are_fetched_right_after_linking(self):
+        state, _ = self.start()
+        self.assertEqual(self.callback(state), "linked")
+        self.assertEqual(self.linked_users, ["user-1"])
+        refused, _ = self.start(user="user-2")
+        self.assertEqual(self.callback(refused, code="code-alice"), "taken")
+        self.assertEqual(self.linked_users, ["user-1"])
 
     def test_state_works_only_once(self):
         state, _ = self.start()
