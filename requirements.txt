@@ -2,3 +2,4 @@ fastapi==0.163.1
 uvicorn==0.54.0
 redis==8.1.0
 supabase==2.34.1
+httpx==0.28.1
