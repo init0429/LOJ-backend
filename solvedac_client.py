@@ -191,7 +191,7 @@ def _to_error(response: httpx.Response) -> SolvedacError:
 
 
 class SolvedacClient:
-    def __init__(self, config: Optional[SolvedacConfig], *, store: TokenStore, cache=None,
+    def __init__(self, config: Optional[SolvedacConfig], *, store: Optional[TokenStore], cache=None,
                  http: Optional[httpx.AsyncClient] = None,
                  sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
                  clock: Callable[[], float] = time.time):
@@ -208,12 +208,16 @@ class SolvedacClient:
         self._local_locks: dict[str, asyncio.Lock] = {}
 
     @classmethod
-    def from_env(cls, *, store: TokenStore, cache=None) -> "SolvedacClient":
+    def from_env(cls, *, store: Optional[TokenStore], cache=None) -> "SolvedacClient":
         return cls(SolvedacConfig.from_env(), store=store, cache=cache)
 
     @property
     def configured(self) -> bool:
         return self._config is not None
+
+    @property
+    def redirect_uri(self) -> str:
+        return self._require_config().redirect_uri
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -330,6 +334,13 @@ class SolvedacClient:
             "code_verifier": code_verifier,
         })
 
+    async def me_for_token(self, access_token: str) -> dict:
+        """방금 받은(아직 저장하지 않은) 토큰의 주인 {id, handle}. 연동을 마무리할 때 쓴다."""
+        response = await self._send("GET", "/api/v4/me", token=access_token)
+        if response.status_code != 200:
+            raise _to_error(response)
+        return response.json()
+
     async def revoke(self, token: str) -> None:
         """access/refresh 어느 쪽을 내도 그 로그인의 토큰이 모두 끝난다."""
         response = await self._send("POST", "/api/v4/oauth/revoke", data={"token": token})
@@ -390,6 +401,8 @@ class SolvedacClient:
             return fresh
 
     async def _tokens_for(self, user_id: str) -> TokenSet:
+        if self._store is None:
+            raise SolvedacNotConfigured(None, "NOT_CONFIGURED", "연동 토큰 저장소가 설정되지 않았습니다.")
         tokens = await self._store.load(user_id)
         if tokens is None:
             raise SolvedacNotLinked(None, "NOT_LINKED", "solved.ac가 연결되어 있지 않습니다.")

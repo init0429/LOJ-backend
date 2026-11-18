@@ -14,6 +14,9 @@ from datetime import datetime, timezone
 from supabase import create_client, Client
 import os
 
+import solvedac_client
+import solvedac_link
+
 # judge/worker.py의 LANGUAGES와 반드시 동기화해서 유지할 것.
 # 여기서 막아두면 judge까지 안 가고 API 단에서 바로 422로 거절됨.
 SupportedLanguage = Literal[
@@ -130,6 +133,16 @@ def get_current_user_id(authorization: Optional[str] = Header(None)) -> str:
 
     return user.id
 
+
+# solved.ac 계정 연동. 앱 설정(SOLVEDAC_CLIENT_ID 등)과 토큰 암호화 키가 모두 있어야 켜진다.
+_solvedac_cipher = solvedac_link.TokenCipher.from_env()
+_solvedac_store = solvedac_link.SupabaseTokenStore(supabase, _solvedac_cipher) if _solvedac_cipher else None
+solvedac = solvedac_client.SolvedacClient.from_env(store=_solvedac_store, cache=async_r)
+if solvedac.configured and _solvedac_store is None:
+    logger.warning("SOLVEDAC_TOKEN_KEY가 비어 있어 solved.ac 연동을 끕니다.")
+app.include_router(solvedac_link.create_router(
+    client=solvedac, store=_solvedac_store, redis=async_r, current_user=get_current_user_id,
+))
 
 
 class Submission(BaseModel):
