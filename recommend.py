@@ -38,6 +38,8 @@ WEAK_TAG_LIMIT = 3
 # 너무 덜 알려진 문제는 피한다. 맞는 문제가 없으면 이 조건 없이 다시 찾는다.
 BOJ_MIN_SOLVERS = 100
 BOJ_CACHE_TTL = 60 * 60
+# "다른 문제 보기"로 새로 고를 수 있는 간격(초). solved.ac 요청 한도를 아끼려는 것.
+BOJ_REFRESH_COOLDOWN = 30
 PAGE = 1000
 # 시도로 치지 않는 판정. 채점이 끝나지 않았거나 채점 서버 탓인 것.
 NOT_ATTEMPTS = {"Pending", "Running", "System Error", "Unknown"}
@@ -322,18 +324,30 @@ class Recommender:
                 return problem
         return None
 
-    async def _boj_picks(self, user_id: str, handle: str, window: tuple[int, int], weak: list[str]) -> list[dict]:
-        """약점 태그마다 BOJ 문제 하나. 한 시간 동안 같은 결과를 보여 준다(요청 한도 아끼기)."""
+    async def _may_refresh(self, user_id: str) -> bool:
+        """새로 고르기는 사용자마다 BOJ_REFRESH_COOLDOWN초에 한 번만 허락한다."""
+        try:
+            return bool(await self.redis.set(f"recommend:refresh:{user_id}", "1", nx=True, ex=BOJ_REFRESH_COOLDOWN))
+        except Exception:
+            return False
+
+    async def _boj_picks(self, user_id: str, handle: str, window: tuple[int, int], weak: list[str],
+                         refresh: bool = False) -> list[dict]:
+        """
+        약점 태그마다 BOJ 문제 하나. 한 시간 동안 같은 결과를 보여 준다(요청 한도 아끼기).
+        refresh면 캐시를 건너뛰고 새로 고른다. 너무 자주 누르면 캐시를 그대로 쓴다.
+        """
         tags = [tag for tag in weak if TAG_KEY.match(tag)]
         if not tags or not self.client.configured:
             return []
         cache_key = f"recommend:boj:{user_id}:{window[0]}-{window[1]}:{','.join(tags)}"
-        try:
-            cached = await self.redis.get(cache_key)
-            if cached:
-                return json.loads(cached)
-        except Exception:
-            logger.warning("추천 캐시를 읽지 못했습니다", exc_info=True)
+        if not (refresh and await self._may_refresh(user_id)):
+            try:
+                cached = await self.redis.get(cache_key)
+                if cached:
+                    return json.loads(cached)
+            except Exception:
+                logger.warning("추천 캐시를 읽지 못했습니다", exc_info=True)
         found = await asyncio.gather(*(self._random_boj(window, tag, handle) for tag in tags))
         picks, seen = [], set()
         for payload in found:
@@ -347,7 +361,7 @@ class Recommender:
             logger.warning("추천 캐시를 저장하지 못했습니다", exc_info=True)
         return picks
 
-    async def recommend(self, user_id: str) -> dict:
+    async def recommend(self, user_id: str, refresh: bool = False) -> dict:
         account = await self.store.account(user_id) if self.store is not None else None
         stats = await run_in_threadpool(self._load_stats, user_id) if account else None
         if account and account.get("status") == "active" and stats is None:
@@ -376,7 +390,7 @@ class Recommender:
             loj_picks = starter_problems(loj["problems"], solved)
         boj_picks = []
         if stats and window and weak:
-            boj_picks = await self._boj_picks(user_id, stats["handle"], window, weak)
+            boj_picks = await self._boj_picks(user_id, stats["handle"], window, weak, refresh)
 
         names = loj["names"]
         tag_list = lambda keys: [{"key": key, "name": names.get(key, key)} for key in keys]  # noqa: E731
@@ -411,9 +425,9 @@ def create_router(*, recommender: Recommender, current_user: Callable) -> APIRou
     router = APIRouter()
 
     @router.get("/recommendations")
-    async def recommendations(user_id: str = Depends(current_user)) -> Any:
+    async def recommendations(refresh: bool = False, user_id: str = Depends(current_user)) -> Any:
         try:
-            return await recommender.recommend(user_id)
+            return await recommender.recommend(user_id, refresh=refresh)
         except HTTPException:
             raise
         except Exception:

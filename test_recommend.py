@@ -281,6 +281,20 @@ class RecommendFlowTests(unittest.TestCase):
         self.assertEqual((len(self.solvedac.calls), len(self.solvedac.queries)), (calls, queries))
         self.assertEqual(again["boj"], result["boj"])
 
+    def test_refresh_picks_new_boj_problems_but_not_too_often(self):
+        db = loj_db(solvedac_stats=[{"user_id": "u", "handle": "alice", "tier": 12, "tag_stats": [], "synced_at": PAST}])
+        recommender = self.make(db, {"u": {"handle": "alice", "status": "active"}})
+        first = run(recommender.recommend("u"))
+        asked = len(self.solvedac.queries)
+        again = run(recommender.recommend("u", refresh=True))
+        self.assertGreater(len(self.solvedac.queries), asked)
+        self.assertNotEqual([p["problem_id"] for p in again["boj"]], [p["problem_id"] for p in first["boj"]])
+        # 30초 안에 또 누르면 방금 고른 것을 그대로 보여 준다.
+        asked = len(self.solvedac.queries)
+        third = run(recommender.recommend("u", refresh=True))
+        self.assertEqual(len(self.solvedac.queries), asked)
+        self.assertEqual(third["boj"], again["boj"])
+
     def test_boj_search_retries_without_the_popularity_filter(self):
         recommender = self.make(loj_db())
 
