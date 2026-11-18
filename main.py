@@ -159,6 +159,11 @@ class Submission(BaseModel):
         return value
 
 
+def parse_time(value: str) -> datetime:
+    """Supabase가 돌려주는 ISO 8601 시각을 시간대가 붙은 datetime으로 바꾼다."""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
 def validate_judging_context(submission: Submission, public_only: bool = False):
     """
     채점을 큐에 넣기 전에 문제·콘테스트·테스트케이스가 유효한지 확인한다.
@@ -168,13 +173,30 @@ def validate_judging_context(submission: Submission, public_only: bool = False):
         problem = supabase.table("problems").select("id").eq("id", submission.problem_id).execute()
         if not problem.data:
             raise HTTPException(404, "문제를 찾을 수 없습니다.")
-        if submission.contest_id is not None:
+        if submission.contest_id is None:
+            # 아직 시작하지 않은 대회의 문제는 대회 밖에서 실행하거나 제출할 수 없다. 예제 실행은
+            # 예제 입출력을 돌려주므로, 막지 않으면 문제 번호만으로 대회 전에 예제를 볼 수 있다.
+            # (브라우저에서 직접 읽는 길은 DB의 RLS가 막는다.)
+            links = (
+                supabase.table("contest_problems")
+                .select("contests(start_time)")
+                .eq("problem_id", submission.problem_id)
+                .execute()
+            )
+            now = datetime.now(timezone.utc)
+            if any(
+                parse_time(row["contests"]["start_time"]) > now
+                for row in links.data or []
+                if row.get("contests")
+            ):
+                raise HTTPException(404, "문제를 찾을 수 없습니다.")
+        else:
             contests = supabase.table("contests").select("start_time, end_time").eq("id", submission.contest_id).execute()
             if not contests.data:
                 raise HTTPException(404, "콘테스트를 찾을 수 없습니다.")
             contest = contests.data[0]
-            start = datetime.fromisoformat(contest["start_time"].replace("Z", "+00:00"))
-            end = datetime.fromisoformat(contest["end_time"].replace("Z", "+00:00"))
+            start = parse_time(contest["start_time"])
+            end = parse_time(contest["end_time"])
             if not start <= datetime.now(timezone.utc) < end:
                 raise HTTPException(409, "콘테스트 진행 시간에만 실행하거나 제출할 수 있습니다.")
             links = supabase.table("contest_problems").select("problem_id").eq("contest_id", submission.contest_id).eq("problem_id", submission.problem_id).execute()

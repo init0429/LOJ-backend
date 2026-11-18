@@ -48,16 +48,28 @@ class SubmissionTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 404)
 
     def test_empty_cases_have_no_dummy_fallback(self):
-        self.query.execute.side_effect = [SimpleNamespace(data=[{"id": 1}]), SimpleNamespace(data=[])]
+        self.query.execute.side_effect = [SimpleNamespace(data=[{"id": 1}]), SimpleNamespace(data=[]), SimpleNamespace(data=[])]
         with self.assertRaises(HTTPException) as caught:
             main.validate_judging_context(self.payload)
         self.assertEqual(caught.exception.status_code, 422)
 
     def test_test_runs_only_require_a_public_case(self):
-        self.query.execute.side_effect = [SimpleNamespace(data=[{"id": 1}]), SimpleNamespace(data=[{"id": 9}])]
+        self.query.execute.side_effect = [SimpleNamespace(data=[{"id": 1}]), SimpleNamespace(data=[]), SimpleNamespace(data=[{"id": 9}])]
         self.assertIsNone(main.validate_judging_context(self.payload, True))
         self.query.eq.assert_any_call("is_hidden", False)
         self.query.limit.assert_called_once_with(1)
+
+    def test_problems_of_upcoming_contests_cannot_be_run_outside_them(self):
+        upcoming = {"contests": {"start_time": "2999-01-01T00:00:00Z"}}
+        self.query.execute.side_effect = [SimpleNamespace(data=[{"id": 1}]), SimpleNamespace(data=[upcoming])]
+        with self.assertRaises(HTTPException) as caught:
+            main.validate_judging_context(self.payload, True)
+        self.assertEqual(caught.exception.status_code, 404)
+
+    def test_problems_of_started_contests_are_open_for_practice(self):
+        started = {"contests": {"start_time": "2000-01-01T00:00:00Z"}}
+        self.query.execute.side_effect = [SimpleNamespace(data=[{"id": 1}]), SimpleNamespace(data=[started, {"contests": None}]), SimpleNamespace(data=[{"id": 9}])]
+        self.assertIsNone(main.validate_judging_context(self.payload, True))
 
     def test_queued_job_carries_no_test_data(self):
         with patch.object(main, "validate_judging_context"), patch.object(main, "enqueue") as enqueue:
