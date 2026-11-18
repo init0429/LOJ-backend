@@ -12,7 +12,7 @@ import uuid
 import time
 import logging
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from supabase import create_client, Client
 import os
 
@@ -86,11 +86,25 @@ async_r = redis.asyncio.from_url(redis_url, socket_connect_timeout=5, socket_tim
 TEST_RUN_TIMEOUT = 25
 logger = logging.getLogger(__name__)
 
-# Shared Redis counters keep admission consistent across API processes.
+# 채점 요청 제한. 카운터와 잠금을 Redis에 두어 API 프로세스가 여럿이어도 같은 기준으로 센다.
+# - 한 사용자가 RATE_WINDOW초 동안 보낼 수 있는 요청(제출과 예제 실행을 합쳐서)은 RATE_LIMIT번.
+# - 채점이 끝나지 않은 제출이 있으면 새 제출을 받지 않고, 예제 실행도 한 번에 하나만 받는다.
+#   횟수 제한만으로는 한 사람이 시간이 오래 걸리는 코드를 연달아 넣어 대기열 앞을 차지할 수 있다.
+#   (화면은 채점 중에 버튼을 잠그므로 보통은 걸리지 않고, 스크립트나 여러 탭에서 보낼 때 걸린다.)
+RATE_LIMIT = 10
+RATE_WINDOW = 60
+# 채점기가 멈춰 결과가 영영 안 나오는 제출 때문에 계속 막히지 않도록, 이보다 오래된 제출은 세지 않는다.
+PENDING_SUBMISSION_WINDOW = timedelta(minutes=10)
+# 제출 잠금은 확인부터 기록까지만 쥐고 있는다. 프로세스가 그사이 죽어도 이 시간(초) 뒤에 풀린다.
+SUBMIT_LOCK_TTL = 30
 RATE_SCRIPT = """
 local count = redis.call('INCR', KEYS[1])
-if count == 1 then redis.call('EXPIRE', KEYS[1], 60) end
-return count
+local ttl = redis.call('TTL', KEYS[1])
+if ttl < 0 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+    ttl = tonumber(ARGV[1])
+end
+return {count, ttl}
 """
 ENQUEUE_SCRIPT = """
 local count = redis.call('LLEN', KEYS[1])
@@ -104,23 +118,77 @@ return 1
 """
 
 
+QUEUE_FULL = "채점 대기열이 가득 찼습니다. 잠시 후 다시 시도하세요."
+JUDGE_UNAVAILABLE = "채점 서버에 연결하지 못했습니다. 잠시 후 다시 시도하세요."
+
+
+def user_key(user_id: str) -> str:
+    """Redis 키에 사용자 id를 그대로 남기지 않는다."""
+    return hashlib.sha256(user_id.encode()).hexdigest()
+
+
+def busy(message: str, retry_after: int = 5) -> HTTPException:
+    return HTTPException(429, message, headers={"Retry-After": str(retry_after)})
+
+
 def check_admission(user_id: str):
-    identity = hashlib.sha256(user_id.encode()).hexdigest()
     try:
-        if r.eval(RATE_SCRIPT, 1, f"judge:rate:{identity}") > 10:
-            raise HTTPException(429, "Too many judging requests. Try again shortly.")
-        if r.llen("submission_queue") >= 100:
-            raise HTTPException(503, "Judging queue is full. Try again shortly.")
+        count, ttl = r.eval(RATE_SCRIPT, 1, f"judge:rate:{user_key(user_id)}", RATE_WINDOW)
+        queued = r.llen("submission_queue") if count <= RATE_LIMIT else 0
     except redis.RedisError:
-        raise HTTPException(503, "Judging admission service unavailable.")
+        raise HTTPException(503, JUDGE_UNAVAILABLE)
+    if count > RATE_LIMIT:
+        wait = max(int(ttl), 1)
+        raise busy(f"채점 요청이 너무 잦습니다. {wait}초 뒤에 다시 시도하세요.", wait)
+    if queued >= 100:
+        raise HTTPException(503, QUEUE_FULL, headers={"Retry-After": "10"})
+
+
+def check_no_pending_submission(user_id: str):
+    """채점이 끝나지 않은 내 제출이 있으면 새 제출을 받지 않는다."""
+    since = (datetime.now(timezone.utc) - PENDING_SUBMISSION_WINDOW).isoformat()
+    try:
+        pending = (
+            supabase.table("submissions").select("id")
+            .eq("user_id", user_id)
+            .in_("status", ["Pending", "Running"])
+            .gte("created_at", since)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        logger.exception("Failed to check pending submissions")
+        raise HTTPException(503, "제출 기록을 확인하지 못했습니다. 잠시 후 다시 시도하세요.")
+    if pending.data:
+        raise busy("앞선 제출을 채점하고 있습니다. 결과가 나온 뒤에 다시 제출하세요.")
+
+
+@contextlib.contextmanager
+def submission_lock(user_id: str):
+    """
+    '채점 중인 제출이 없는지 확인 → 제출 기록'을 한 사람당 한 번에 하나씩만 하게 한다.
+    잠그지 않으면 동시에 보낸 요청이 모두 확인을 통과해 한꺼번에 들어간다.
+    """
+    key = f"judge:submitting:{user_key(user_id)}"
+    try:
+        acquired = r.set(key, "1", nx=True, ex=SUBMIT_LOCK_TTL)
+    except redis.RedisError:
+        raise HTTPException(503, JUDGE_UNAVAILABLE)
+    if not acquired:
+        raise busy("앞선 제출을 접수하고 있습니다. 잠시 후 다시 제출하세요.")
+    try:
+        yield
+    finally:
+        with contextlib.suppress(redis.RedisError):
+            r.delete(key)
 
 
 def enqueue(task: dict):
     payload = json.dumps(task)
     if len(payload.encode("utf-8")) > 1048576:
-        raise HTTPException(422, "Judging payload exceeds the 1 MiB limit.")
+        raise HTTPException(422, "제출 내용이 너무 큽니다(1 MiB 제한).")
     if not r.eval(ENQUEUE_SCRIPT, 1, "submission_queue", payload):
-        raise HTTPException(503, "Judging queue is full. Try again shortly.")
+        raise HTTPException(503, QUEUE_FULL, headers={"Retry-After": "10"})
 
 
 def get_current_user_id(authorization: Optional[str] = Header(None)) -> str:
@@ -248,21 +316,23 @@ def submit_code(submission: Submission, user_id: str = Depends(get_current_user_
     check_admission(user_id)
     submission_id = str(uuid.uuid4())
 
-    validate_judging_context(submission)
-
-    try:
-        supabase.table("submissions").insert({
-            "id": submission_id,
-            "problem_id": submission.problem_id,
-            "language": submission.language,
-            "code": submission.code,
-            "status": "Pending",
-            "user_id": user_id,
-            "contest_id": submission.contest_id,
-        }).execute()
-    except Exception:
-        logger.exception("Failed to insert submission")
-        raise HTTPException(503, "제출을 기록하지 못했습니다. 다시 시도하세요.")
+    # 기록이 Pending으로 남으면 그때부터는 check_no_pending_submission이 다음 제출을 막는다.
+    with submission_lock(user_id):
+        check_no_pending_submission(user_id)
+        validate_judging_context(submission)
+        try:
+            supabase.table("submissions").insert({
+                "id": submission_id,
+                "problem_id": submission.problem_id,
+                "language": submission.language,
+                "code": submission.code,
+                "status": "Pending",
+                "user_id": user_id,
+                "contest_id": submission.contest_id,
+            }).execute()
+        except Exception:
+            logger.exception("Failed to insert submission")
+            raise HTTPException(503, "제출을 기록하지 못했습니다. 다시 시도하세요.")
 
     task_data = {
         "submission_id": submission_id,
@@ -295,6 +365,23 @@ async def test_code(submission: Submission, user_id: str = Depends(get_current_u
     # 스레드 풀로 보낸다. 요청마다 스레드를 끝까지 붙잡으면 동시에 수십 명이 예제를
     # 실행할 때 스레드 풀이 바닥나서 /submit까지 멈춘다.
     await run_in_threadpool(check_admission, user_id)
+    # 예제 실행은 한 사람당 한 번에 하나. 결과를 기다리는 동안 쥐고 있다가 응답과 함께 놓는다.
+    # 응답하기 전에 프로세스가 죽어도 기다림 제한 시간이 지나면 풀린다.
+    slot = f"judge:testing:{user_key(user_id)}"
+    try:
+        acquired = await async_r.set(slot, "1", nx=True, ex=TEST_RUN_TIMEOUT + 5)
+    except redis.RedisError:
+        raise HTTPException(503, JUDGE_UNAVAILABLE)
+    if not acquired:
+        raise busy("예제를 실행하고 있습니다. 결과가 나온 뒤에 다시 실행하세요.")
+    try:
+        return await run_test(submission)
+    finally:
+        with contextlib.suppress(redis.RedisError):
+            await async_r.delete(slot)
+
+
+async def run_test(submission: Submission):
     await run_in_threadpool(validate_judging_context, submission, True)
     test_id = str(uuid.uuid4())
 

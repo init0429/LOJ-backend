@@ -9,8 +9,10 @@ from unittest.mock import Mock
 
 
 class HTTPError(Exception):
-    def __init__(self, status, detail):
+    def __init__(self, status, detail, headers=None):
         self.status_code = status
+        self.detail = detail
+        self.headers = headers or {}
 
 
 class AdmissionTests(unittest.TestCase):
@@ -18,10 +20,11 @@ class AdmissionTests(unittest.TestCase):
         tree = ast.parse(Path(__file__).with_name("main.py").read_text())
         selected = []
         for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name in {"check_admission", "enqueue"}:
+            if isinstance(node, ast.FunctionDef) and node.name in {"check_admission", "enqueue", "user_key", "busy"}:
                 selected.append(node)
             if isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id in {"RATE_SCRIPT", "ENQUEUE_SCRIPT"}
+                isinstance(t, ast.Name) and t.id in {"RATE_SCRIPT", "ENQUEUE_SCRIPT", "RATE_LIMIT", "RATE_WINDOW",
+                                                     "QUEUE_FULL", "JUDGE_UNAVAILABLE"}
                 for t in node.targets
             ):
                 selected.append(node)
@@ -32,14 +35,30 @@ class AdmissionTests(unittest.TestCase):
         exec(compile(ast.Module(body=selected, type_ignores=[]), "main.py", "exec"), self.ns)
 
     def test_rate_limit_rejects_before_queue_check(self):
-        self.queue.eval.return_value = 11
+        self.queue.eval.return_value = [11, 42]
         with self.assertRaises(HTTPError) as error:
             self.ns["check_admission"]("user")
         self.assertEqual(error.exception.status_code, 429)
         self.queue.llen.assert_not_called()
 
+    def test_rate_limit_says_how_long_to_wait(self):
+        self.queue.eval.return_value = [11, 42]
+        with self.assertRaises(HTTPError) as error:
+            self.ns["check_admission"]("user")
+        self.assertIn("42초", error.exception.detail)
+        self.assertEqual(error.exception.headers, {"Retry-After": "42"})
+        # 사용자 id는 해시로만 키에 남는다.
+        key = self.queue.eval.call_args.args[2]
+        self.assertEqual(key, "judge:rate:" + hashlib.sha256(b"user").hexdigest())
+        self.assertEqual(self.queue.eval.call_args.args[3], 60)
+
+    def test_requests_within_the_limit_pass(self):
+        self.queue.eval.return_value = [10, 5]
+        self.queue.llen.return_value = 3
+        self.assertIsNone(self.ns["check_admission"]("user"))
+
     def test_queue_full_rejects(self):
-        self.queue.eval.return_value = 1
+        self.queue.eval.return_value = [1, 60]
         self.queue.llen.return_value = 100
         with self.assertRaises(HTTPError) as error:
             self.ns["check_admission"]("user")

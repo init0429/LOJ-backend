@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,14 +21,19 @@ class SubmissionTests(unittest.TestCase):
         self.payload = main.Submission(problem_id=1, language="python", code="print(1)")
         self.db = MagicMock()
         self.query = self.db.table.return_value
-        for method in ("select", "eq", "order", "limit", "insert", "update"):
+        for method in ("select", "eq", "in_", "gte", "order", "limit", "insert", "update"):
             getattr(self.query, method).return_value = self.query
+        # 따로 정하지 않으면 채점 중인 제출이 없는 것으로 본다.
+        self.query.execute.return_value = SimpleNamespace(data=[])
         self.db_patch = patch.object(main, "supabase", self.db)
         self.db_patch.start()
         self.addCleanup(self.db_patch.stop)
         self.admission_patch = patch.object(main, "check_admission")
         self.admission_patch.start()
         self.addCleanup(self.admission_patch.stop)
+        self.redis_patch = patch.object(main, "r")
+        self.redis = self.redis_patch.start()
+        self.addCleanup(self.redis_patch.stop)
 
     def test_blank_code_and_invalid_ids_are_rejected(self):
         for values in ({"code": "  "}, {"problem_id": 0}, {"contest_id": -1}):
@@ -90,6 +96,56 @@ class SubmissionTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as caught:
             main.validate_judging_context(payload)
         self.assertEqual(caught.exception.status_code, 400)
+
+    def test_pending_submission_blocks_the_next_one(self):
+        self.query.execute.return_value = SimpleNamespace(data=[{"id": "earlier"}])
+        with patch.object(main, "validate_judging_context") as validate, patch.object(main, "enqueue") as enqueue:
+            with self.assertRaises(HTTPException) as caught:
+                main.submit_code(self.payload, "user-1")
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertIn("Retry-After", caught.exception.headers)
+        validate.assert_not_called()
+        self.query.insert.assert_not_called()
+        enqueue.assert_not_called()
+        # 잠금은 거절할 때도 풀어 둔다.
+        self.redis.delete.assert_called_once()
+
+    def test_pending_check_ignores_finished_and_stale_submissions(self):
+        before = datetime.now(timezone.utc)
+        main.check_no_pending_submission("user-1")
+        self.query.eq.assert_any_call("user_id", "user-1")
+        self.query.in_.assert_called_once_with("status", ["Pending", "Running"])
+        column, since = self.query.gte.call_args.args
+        self.assertEqual(column, "created_at")
+        self.assertAlmostEqual(
+            (before - datetime.fromisoformat(since)).total_seconds(),
+            main.PENDING_SUBMISSION_WINDOW.total_seconds(), delta=5,
+        )
+
+    def test_pending_check_failure_is_not_a_free_pass(self):
+        self.query.execute.side_effect = RuntimeError("db down")
+        with self.assertRaises(HTTPException) as caught:
+            main.check_no_pending_submission("user-1")
+        self.assertEqual(caught.exception.status_code, 503)
+
+    def test_concurrent_submission_is_rejected_while_one_is_being_recorded(self):
+        self.redis.set.return_value = None  # 다른 요청이 잠금을 쥐고 있다.
+        with patch.object(main, "enqueue") as enqueue, self.assertRaises(HTTPException) as caught:
+            main.submit_code(self.payload, "user-1")
+        self.assertEqual(caught.exception.status_code, 429)
+        self.db.table.assert_not_called()
+        enqueue.assert_not_called()
+        # 남이 쥔 잠금은 건드리지 않는다.
+        self.redis.delete.assert_not_called()
+
+    def test_submission_lock_is_per_user_and_released(self):
+        with patch.object(main, "validate_judging_context"), patch.object(main, "enqueue"):
+            main.submit_code(self.payload, "user-1")
+        key = self.redis.set.call_args.args[0]
+        self.assertTrue(key.startswith("judge:submitting:"))
+        self.assertNotIn("user-1", key)
+        self.assertEqual(self.redis.set.call_args.kwargs, {"nx": True, "ex": main.SUBMIT_LOCK_TTL})
+        self.redis.delete.assert_called_once_with(key)
 
     def test_queue_failure_marks_submission_failed(self):
         with patch.object(main, "validate_judging_context"), patch.object(main, "r") as queue:
@@ -167,10 +223,13 @@ class TestRunTests(unittest.TestCase):
             patcher = patch.object(main, name)
             patcher.start()
             self.addCleanup(patcher.stop)
+        self.async_r = MagicMock()
+        self.async_r.set = AsyncMock(return_value=True)
+        self.async_r.delete = AsyncMock()
 
     def run_test(self, pubsub, **enqueue):
         # pubsub()은 동기 메서드라 MagicMock을 직접 넘긴다 (patch가 고르는 AsyncMock이면 코루틴이 된다).
-        async_r = MagicMock()
+        async_r = self.async_r
         async_r.pubsub.return_value = pubsub
         with patch.object(main, "async_r", async_r), patch.object(main, "enqueue", **enqueue) as queued:
             return asyncio.run(main.test_code(self.payload, "user-1")), queued
@@ -199,6 +258,27 @@ class TestRunTests(unittest.TestCase):
             with self.subTest(data=data), self.assertRaises(HTTPException) as caught:
                 self.run_test(fake_pubsub([{"data": data}]))
             self.assertEqual(caught.exception.status_code, 502)
+
+    def test_only_one_example_run_at_a_time(self):
+        self.async_r.set.return_value = None  # 같은 사람의 예제 실행이 이미 진행 중이다.
+        with self.assertRaises(HTTPException) as caught:
+            self.run_test(fake_pubsub())
+        self.assertEqual(caught.exception.status_code, 429)
+        self.async_r.pubsub.assert_not_called()
+        self.async_r.delete.assert_not_awaited()
+
+    def test_example_run_slot_is_released_after_result_and_failure(self):
+        self.run_test(fake_pubsub([{"data": json.dumps({"status": "Accepted"})}]))
+        key = self.async_r.set.await_args.args[0]
+        self.assertTrue(key.startswith("judge:testing:"))
+        self.assertNotIn("user-1", key)
+        self.assertEqual(self.async_r.set.await_args.kwargs, {"nx": True, "ex": main.TEST_RUN_TIMEOUT + 5})
+        self.async_r.delete.assert_awaited_once_with(key)
+
+        self.async_r.delete.reset_mock()
+        with self.assertRaises(HTTPException):
+            self.run_test(fake_pubsub(), side_effect=main.redis.ConnectionError("unavailable"))
+        self.async_r.delete.assert_awaited_once_with(key)
 
     def test_silent_judge_times_out(self):
         with patch.object(main, "TEST_RUN_TIMEOUT", 0.05), self.assertRaises(HTTPException) as caught:
