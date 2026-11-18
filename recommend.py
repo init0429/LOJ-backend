@@ -286,11 +286,13 @@ class Recommender:
         except Exception:
             # 태그 마이그레이션 전이면 티어와 태그 없이 추천한다.
             raw = all_rows(lambda: db.table("problems").select("id, title, difficulty").order("id"))
+        # 아직 끝나지 않은 대회의 문제는 추천하지 않는다. 시작 전이면 공개 전이고, 진행 중이면
+        # 추천 화면의 태그가 대회 참가자에게 풀이 힌트가 된다.
         now = datetime.now(timezone.utc)
         hidden = {
             row["problem_id"]
-            for row in db.table("contest_problems").select("problem_id, contests(start_time)").execute().data or []
-            if row.get("contests") and datetime.fromisoformat(row["contests"]["start_time"].replace("Z", "+00:00")) > now
+            for row in db.table("contest_problems").select("problem_id, contests(end_time)").execute().data or []
+            if row.get("contests") and datetime.fromisoformat(row["contests"]["end_time"].replace("Z", "+00:00")) > now
         }
         problems = [
             {

@@ -211,6 +211,8 @@ class FakeSolvedac:
 
 SOON = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
 PAST = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+LATER = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+EARLIER = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
 
 
 def loj_db(**extra):
@@ -220,10 +222,12 @@ def loj_db(**extra):
             {"id": 2, "title": "최단 경로", "difficulty": 3, "solvedac_tier": 12, "problem_tags": [{"tag_key": "dp"}]},
             {"id": 3, "title": "대회 문제", "difficulty": 3, "solvedac_tier": 12, "problem_tags": [{"tag_key": "dp"}]},
             {"id": 4, "title": "지난 대회", "difficulty": 2, "solvedac_tier": 11, "problem_tags": []},
+            {"id": 5, "title": "진행 중인 대회", "difficulty": 1, "solvedac_tier": 2, "problem_tags": [{"tag_key": "math"}]},
         ],
         "contest_problems": [
-            {"problem_id": 3, "contests": {"start_time": SOON}},
-            {"problem_id": 4, "contests": {"start_time": PAST}},
+            {"problem_id": 3, "contests": {"start_time": SOON, "end_time": LATER}},
+            {"problem_id": 4, "contests": {"start_time": EARLIER, "end_time": PAST}},
+            {"problem_id": 5, "contests": {"start_time": PAST, "end_time": SOON}},
         ],
         "tags": [{"key": "dp", "name_ko": "다이나믹 프로그래밍"}, {"key": "math", "name_ko": "수학"}],
         "submissions": [],
@@ -247,7 +251,8 @@ class RecommendFlowTests(unittest.TestCase):
         result = run(self.make(loj_db()).recommend("new"))
         self.assertTrue(result["starter"])
         self.assertEqual(result["basis"], {"source": None, "tier": None, "linked": False, "handle": None, "synced_at": None})
-        self.assertEqual([p["id"] for p in result["loj"]], [1, 4, 2])  # 시작 전 대회의 3번은 빠진다
+        # 시작 전 대회의 3번과 진행 중인 대회의 5번은 빠지고, 끝난 대회의 4번은 들어간다.
+        self.assertEqual([p["id"] for p in result["loj"]], [1, 4, 2])
         self.assertEqual((result["boj"], result["weak_tags"]), ([], []))
 
     def test_loj_history_alone_estimates_a_tier(self):
