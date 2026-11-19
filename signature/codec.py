@@ -206,6 +206,22 @@ def encode_input(sig: Signature, values: list) -> str:
     return "\n".join(encode_value(p.type, v) for p, v in zip(sig.params, values)) + "\n"
 
 
+def _plain(value):
+    if isinstance(value, _Raw):
+        return float(value)
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    return value
+
+
+def normalize_output(t: Type, text: str) -> str:
+    """
+    같은 답을 드라이버가 출력하는 모양(double은 소수점 5자리, bool은 true/false).
+    저장된 답이 이와 다르면 함수 구현으로는 맞힐 수 없다. 맞지 않는 답이면 SignatureError
+    """
+    return encode_output(t, _plain(decode_output(t, text)))
+
+
 def encode_output(t: Type, value) -> str:
     """답으로 기대하는 출력. 드라이버가 반환값을 출력하는 모양과 같다."""
     if t.kind == "scalar":

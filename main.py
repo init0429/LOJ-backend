@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from supabase import create_client, Client
 import os
 
+import function_problems
 import recommend
 import solvedac_client
 import solvedac_link
@@ -244,6 +245,8 @@ class Submission(BaseModel):
     language: SupportedLanguage
     code: str = Field(min_length=1, max_length=100_000)
     contest_id: Optional[int] = Field(default=None, gt=0)
+    # function: 함수(메서드)만 써서 낸다. 문제에 시그니처가 있어야 한다(function_problems.py).
+    mode: Literal["program", "function"] = "program"
 
     @field_validator("code")
     @classmethod
@@ -258,31 +261,39 @@ def parse_time(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def problem_released(problem_id: int) -> bool:
+    """아직 시작하지 않은 대회에 든 문제가 아닌지. DB의 problem_is_released()와 같은 기준이다."""
+    links = (
+        supabase.table("contest_problems")
+        .select("contests(start_time)")
+        .eq("problem_id", problem_id)
+        .execute()
+    )
+    now = datetime.now(timezone.utc)
+    return not any(
+        parse_time(row["contests"]["start_time"]) > now
+        for row in links.data or []
+        if row.get("contests")
+    )
+
+
 def validate_judging_context(submission: Submission, public_only: bool = False):
     """
     채점을 큐에 넣기 전에 문제·콘테스트·테스트케이스가 유효한지 확인한다.
     테스트 데이터 자체는 judge가 DB에서 직접 읽으므로 여기서는 존재 여부만 본다.
+    함수 구현으로 내면 문제의 시그니처(DB에 저장된 그대로)를 돌려준다.
     """
     try:
-        problem = supabase.table("problems").select("id").eq("id", submission.problem_id).execute()
+        # 시그니처는 함수 구현일 때만 읽는다. 마이그레이션 전에도 일반 제출은 그대로 된다.
+        columns = "id, signature" if submission.mode == "function" else "id"
+        problem = supabase.table("problems").select(columns).eq("id", submission.problem_id).execute()
         if not problem.data:
             raise HTTPException(404, "문제를 찾을 수 없습니다.")
         if submission.contest_id is None:
             # 아직 시작하지 않은 대회의 문제는 대회 밖에서 실행하거나 제출할 수 없다. 예제 실행은
             # 예제 입출력을 돌려주므로, 막지 않으면 문제 번호만으로 대회 전에 예제를 볼 수 있다.
             # (브라우저에서 직접 읽는 길은 DB의 RLS가 막는다.)
-            links = (
-                supabase.table("contest_problems")
-                .select("contests(start_time)")
-                .eq("problem_id", submission.problem_id)
-                .execute()
-            )
-            now = datetime.now(timezone.utc)
-            if any(
-                parse_time(row["contests"]["start_time"]) > now
-                for row in links.data or []
-                if row.get("contests")
-            ):
+            if not problem_released(submission.problem_id):
                 raise HTTPException(404, "문제를 찾을 수 없습니다.")
         else:
             contests = supabase.table("contests").select("start_time, end_time").eq("id", submission.contest_id).execute()
@@ -301,11 +312,19 @@ def validate_judging_context(submission: Submission, public_only: bool = False):
             query = query.eq("is_hidden", False)
         if not query.limit(1).execute().data:
             raise HTTPException(422, "실행 가능한 테스트케이스가 없습니다.")
+        return problem.data[0].get("signature")
     except HTTPException:
         raise
     except Exception:
         logger.exception("Failed to load judging context")
         raise HTTPException(503, "채점 정보를 불러오지 못했습니다. 잠시 후 다시 시도하세요.")
+
+# 함수형 문제: 푸는 화면의 시작 코드와 관리자 화면의 시그니처 도구
+app.include_router(function_problems.create_router(
+    supabase=supabase, current_user=get_current_user_id,
+    released=lambda problem_id: problem_released(problem_id),
+))
+
 
 @app.get("/health")
 async def health_check():
@@ -319,17 +338,25 @@ def submit_code(submission: Submission, user_id: str = Depends(get_current_user_
     # 기록이 Pending으로 남으면 그때부터는 check_no_pending_submission이 다음 제출을 막는다.
     with submission_lock(user_id):
         check_no_pending_submission(user_id)
-        validate_judging_context(submission)
+        raw_signature = validate_judging_context(submission)
+        _, code = function_problems.judged_code(
+            submission.mode, submission.language, submission.code, raw_signature,
+        )
+        row = {
+            "id": submission_id,
+            "problem_id": submission.problem_id,
+            "language": submission.language,
+            # 함수 구현이어도 기록에는 사용자가 쓴 코드를 남긴다. 채점기에는 합친 프로그램을 보낸다.
+            "code": submission.code,
+            "status": "Pending",
+            "user_id": user_id,
+            "contest_id": submission.contest_id,
+        }
+        if submission.mode != "program":
+            # 기본값이 program이라 일반 제출은 적지 않는다(마이그레이션 전에도 제출이 되도록).
+            row["mode"] = submission.mode
         try:
-            supabase.table("submissions").insert({
-                "id": submission_id,
-                "problem_id": submission.problem_id,
-                "language": submission.language,
-                "code": submission.code,
-                "status": "Pending",
-                "user_id": user_id,
-                "contest_id": submission.contest_id,
-            }).execute()
+            supabase.table("submissions").insert(row).execute()
         except Exception:
             logger.exception("Failed to insert submission")
             raise HTTPException(503, "제출을 기록하지 못했습니다. 다시 시도하세요.")
@@ -338,7 +365,7 @@ def submit_code(submission: Submission, user_id: str = Depends(get_current_user_
         "submission_id": submission_id,
         "problem_id": submission.problem_id,
         "language": submission.language,
-        "code": submission.code,
+        "code": code,
     }
 
     try:
@@ -382,7 +409,10 @@ async def test_code(submission: Submission, user_id: str = Depends(get_current_u
 
 
 async def run_test(submission: Submission):
-    await run_in_threadpool(validate_judging_context, submission, True)
+    raw_signature = await run_in_threadpool(validate_judging_context, submission, True)
+    sig, code = function_problems.judged_code(
+        submission.mode, submission.language, submission.code, raw_signature,
+    )
     test_id = str(uuid.uuid4())
 
     task_data = {
@@ -391,7 +421,7 @@ async def run_test(submission: Submission):
         "expires_at": time.time() + TEST_RUN_TIMEOUT,
         "problem_id": submission.problem_id,
         "language": submission.language,
-        "code": submission.code,
+        "code": code,
     }
 
     channel_name = f"test_result:{test_id}"
@@ -408,6 +438,8 @@ async def run_test(submission: Submission):
                     result = json.loads(message["data"])
                     if not isinstance(result, dict) or not isinstance(result.get("status"), str):
                         raise ValueError("Invalid judge response")
+                    if sig is not None:
+                        result = function_problems.add_display(sig, result)
                     return {"status": "success", "result": result}
     except redis.RedisError:
         logger.exception("Test-run queue unavailable")

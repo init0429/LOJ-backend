@@ -15,6 +15,12 @@ with patch("supabase.create_client"):
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+TWO_SUM = {
+    "function": "twoSum",
+    "params": [{"name": "nums", "type": "int[]"}, {"name": "target", "type": "int"}],
+    "returns": "int[]",
+}
+
 
 class SubmissionTests(unittest.TestCase):
     def setUp(self):
@@ -82,6 +88,48 @@ class SubmissionTests(unittest.TestCase):
             main.submit_code(self.payload, "user-1")
         task = enqueue.call_args.args[0]
         self.assertEqual(set(task), {"submission_id", "problem_id", "language", "code"})
+
+    def test_program_submission_is_stored_and_queued_as_written(self):
+        with patch.object(main, "validate_judging_context", return_value=TWO_SUM), patch.object(main, "enqueue") as enqueue:
+            main.submit_code(self.payload, "user-1")
+        row = self.query.insert.call_args.args[0]
+        # 일반 제출은 mode를 적지 않는다(DB 기본값 program). 마이그레이션 전에도 제출이 된다.
+        self.assertNotIn("mode", row)
+        self.assertEqual(row["code"], "print(1)")
+        self.assertEqual(enqueue.call_args.args[0]["code"], "print(1)")
+
+    def test_function_submission_keeps_the_written_code_and_queues_a_full_program(self):
+        code = "class Solution {\npublic:\n    vector<int> twoSum(vector<int>& nums, int target) { return {0, 1}; }\n};\n"
+        payload = self.payload.model_copy(update={"mode": "function", "language": "cpp", "code": code})
+        with patch.object(main, "validate_judging_context", return_value=TWO_SUM), patch.object(main, "enqueue") as enqueue:
+            main.submit_code(payload, "user-1")
+        row = self.query.insert.call_args.args[0]
+        self.assertEqual((row["mode"], row["code"]), ("function", code))
+        queued = enqueue.call_args.args[0]["code"]
+        self.assertIn(code, queued)
+        self.assertIn("twoSum", queued.replace(code, ""))
+
+    def test_function_submission_without_signature_is_rejected_before_recording(self):
+        payload = self.payload.model_copy(update={"mode": "function"})
+        for raw, language in ((None, "python"), (TWO_SUM, "sql")):
+            with self.subTest(language=language), patch.object(main, "validate_judging_context", return_value=raw), \
+                    patch.object(main, "enqueue") as enqueue, self.assertRaises(HTTPException) as caught:
+                main.submit_code(payload.model_copy(update={"language": language}), "user-1")
+            self.assertEqual(caught.exception.status_code, 422)
+            self.query.insert.assert_not_called()
+            enqueue.assert_not_called()
+
+    def test_signature_is_read_only_for_function_submissions(self):
+        self.query.execute.side_effect = [SimpleNamespace(data=[{"id": 1}]), SimpleNamespace(data=[]), SimpleNamespace(data=[{"id": 9}])]
+        self.assertIsNone(main.validate_judging_context(self.payload))
+        self.query.select.assert_any_call("id")
+        self.query.execute.side_effect = [SimpleNamespace(data=[{"id": 1, "signature": TWO_SUM}]), SimpleNamespace(data=[]), SimpleNamespace(data=[{"id": 9}])]
+        self.assertEqual(main.validate_judging_context(self.payload.model_copy(update={"mode": "function"})), TWO_SUM)
+        self.query.select.assert_any_call("id, signature")
+
+    def test_unknown_mode_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            main.Submission(**(self.payload.model_dump() | {"mode": "class"}))
 
     def test_ended_contest_rejects_submission(self):
         payload = self.payload.model_copy(update={"contest_id": 1})
@@ -279,6 +327,24 @@ class TestRunTests(unittest.TestCase):
         with self.assertRaises(HTTPException):
             self.run_test(fake_pubsub(), side_effect=main.redis.ConnectionError("unavailable"))
         self.async_r.delete.assert_awaited_once_with(key)
+
+    def test_function_example_run_shows_arguments(self):
+        code = "class Solution {\npublic:\n    vector<int> twoSum(vector<int>& nums, int target) { return {1, 0}; }\n};\n"
+        self.payload = self.payload.model_copy(update={"mode": "function", "language": "cpp", "code": code})
+        main.validate_judging_context.return_value = TWO_SUM
+        case = {"id": 1, "status": "Wrong Answer", "input": "4\n2 7 11 15\n9\n", "expected": "0 1", "actual": "1 0"}
+        response, queued = self.run_test(fake_pubsub([{"data": json.dumps({"status": "Wrong Answer", "test_cases": [case]})}]))
+        self.assertIn(code, queued.call_args.args[0]["code"])
+        shown = response["result"]["test_cases"][0]
+        self.assertEqual(shown["display"], {"input": "nums = [2,7,11,15], target = 9", "expected": "[0,1]", "actual": "[1,0]"})
+        # 원문도 그대로 둔다.
+        self.assertEqual(shown["input"], case["input"])
+
+    def test_program_example_run_has_no_display(self):
+        main.validate_judging_context.return_value = TWO_SUM
+        case = {"id": 1, "status": "Accepted", "input": "4\n2 7 11 15\n9\n", "expected": "0 1", "actual": "0 1"}
+        response, _ = self.run_test(fake_pubsub([{"data": json.dumps({"status": "Accepted", "test_cases": [case]})}]))
+        self.assertNotIn("display", response["result"]["test_cases"][0])
 
     def test_silent_judge_times_out(self):
         with patch.object(main, "TEST_RUN_TIMEOUT", 0.05), self.assertRaises(HTTPException) as caught:

@@ -16,6 +16,7 @@ from .codec import (
     format_args,
     format_value,
     leetcode_to_oj,
+    normalize_output,
     oj_to_leetcode,
     parse_leetcode_input,
     parse_leetcode_output,
@@ -54,6 +55,6 @@ def compose(sig: Signature, language: str, code: str) -> str:
 
 __all__ = [
     "LANGUAGES", "Signature", "SignatureError", "Type", "compose", "decode_input", "decode_output",
-    "encode_input", "encode_output", "format_args", "format_value", "leetcode_to_oj", "oj_to_leetcode",
+    "encode_input", "encode_output", "format_args", "format_value", "leetcode_to_oj", "normalize_output", "oj_to_leetcode",
     "parse_leetcode_input", "parse_leetcode_output", "parse_signature", "parse_type", "starter", "starters",
 ]
