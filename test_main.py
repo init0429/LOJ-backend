@@ -119,13 +119,41 @@ class SubmissionTests(unittest.TestCase):
             self.query.insert.assert_not_called()
             enqueue.assert_not_called()
 
-    def test_signature_is_read_only_for_function_submissions(self):
+    def test_problem_is_read_whole_so_missing_columns_do_not_break_judging(self):
+        # 마이그레이션 전이라 signature나 contest_only 칸이 없어도 일반 제출은 된다.
         self.query.execute.side_effect = [SimpleNamespace(data=[{"id": 1}]), SimpleNamespace(data=[]), SimpleNamespace(data=[{"id": 9}])]
         self.assertIsNone(main.validate_judging_context(self.payload))
-        self.query.select.assert_any_call("id")
+        self.query.select.assert_any_call("*")
         self.query.execute.side_effect = [SimpleNamespace(data=[{"id": 1, "signature": TWO_SUM}]), SimpleNamespace(data=[]), SimpleNamespace(data=[{"id": 9}])]
         self.assertEqual(main.validate_judging_context(self.payload.model_copy(update={"mode": "function"})), TWO_SUM)
-        self.query.select.assert_any_call("id, signature")
+
+    def test_contest_only_problems_are_judged_only_inside_their_contest(self):
+        contest_only = {"id": 1000000001, "contest_only": True}
+        self.query.execute.side_effect = [SimpleNamespace(data=[contest_only])]
+        with self.assertRaises(HTTPException) as caught:
+            main.validate_judging_context(self.payload)
+        self.assertEqual(caught.exception.status_code, 404)
+        self.assertIn("대회", caught.exception.detail)
+        running = {"start_time": "2000-01-01T00:00:00Z", "end_time": "2999-01-01T00:00:00Z"}
+        self.query.execute.side_effect = [
+            SimpleNamespace(data=[contest_only]), SimpleNamespace(data=[running]),
+            SimpleNamespace(data=[{"problem_id": 1000000001}]), SimpleNamespace(data=[{"id": 9}]),
+        ]
+        self.assertIsNone(main.validate_judging_context(self.payload.model_copy(update={"contest_id": 1})))
+
+    def test_release_follows_the_database_rule(self):
+        started = SimpleNamespace(data=[{"contests": {"start_time": "2000-01-01T00:00:00Z"}}])
+        upcoming = SimpleNamespace(data=[{"contests": {"start_time": "2999-01-01T00:00:00Z"}}])
+        none = SimpleNamespace(data=[])
+        cases = [
+            (none, False, True), (started, False, True), (upcoming, False, False),
+            # 대회 전용 문제는 시작한 대회에 들어 있을 때만 읽힌다.
+            (none, True, False), (started, True, True), (upcoming, True, False),
+        ]
+        for links, contest_only, expected in cases:
+            with self.subTest(links=links.data, contest_only=contest_only):
+                self.query.execute.side_effect = [links]
+                self.assertEqual(main.problem_released(1, contest_only), expected)
 
     def test_unknown_mode_is_rejected(self):
         with self.assertRaises(ValidationError):
@@ -203,6 +231,36 @@ class SubmissionTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 503)
         self.query.update.assert_called_once_with({"status": "System Error"})
 
+
+
+class PublishLoopTests(unittest.TestCase):
+    def run_loop(self, rpc_results):
+        db = MagicMock()
+        db.rpc.return_value.execute.side_effect = rpc_results
+        sleeps = []
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) >= len(rpc_results):
+                raise asyncio.CancelledError
+
+        with patch.object(main, "supabase", db), patch.object(main.asyncio, "sleep", fake_sleep), \
+                self.assertLogs(main.logger, level="INFO") as logs, self.assertRaises(asyncio.CancelledError):
+            main.logger.info("start")
+            asyncio.run(main.publish_contest_problems_forever())
+        return db, sleeps, logs.output
+
+    def test_publishing_runs_periodically_and_reports_moves(self):
+        db, sleeps, logs = self.run_loop([SimpleNamespace(data=0), SimpleNamespace(data=2)])
+        db.rpc.assert_called_with("publish_contest_problems")
+        self.assertEqual(sleeps, [main.PUBLISH_INTERVAL] * 2)
+        self.assertTrue(any("2개를 공개" in line for line in logs))
+
+    def test_repeated_failures_are_logged_once_and_the_loop_keeps_going(self):
+        error = RuntimeError("function does not exist")
+        _db, sleeps, logs = self.run_loop([error, error, SimpleNamespace(data=0)])
+        self.assertEqual(len(sleeps), 3)
+        self.assertEqual(sum("공개하지 못했습니다" in line for line in logs), 1)
 
 
 class ConfigurationTests(unittest.TestCase):

@@ -223,6 +223,8 @@ def loj_db(**extra):
             {"id": 3, "title": "대회 문제", "difficulty": 3, "solvedac_tier": 12, "problem_tags": [{"tag_key": "dp"}]},
             {"id": 4, "title": "지난 대회", "difficulty": 2, "solvedac_tier": 11, "problem_tags": []},
             {"id": 5, "title": "진행 중인 대회", "difficulty": 1, "solvedac_tier": 2, "problem_tags": [{"tag_key": "math"}]},
+            # 대회 전용 문제는 대회가 끝나 공개(contest_only가 false)되기 전에는 추천하지 않는다.
+            {"id": 1000000001, "title": "대회 전용", "difficulty": 1, "solvedac_tier": 1, "contest_only": True, "problem_tags": []},
         ],
         "contest_problems": [
             {"problem_id": 3, "contests": {"start_time": SOON, "end_time": LATER}},

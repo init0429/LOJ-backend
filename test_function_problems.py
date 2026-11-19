@@ -60,7 +60,7 @@ def fake_supabase(*, problem=None, cases=(), admins=("admin",), error=None):
     return db, tables
 
 
-def make_client(db, released=lambda _id: True):
+def make_client(db, released=lambda _id, _contest_only: True):
     def current_user(authorization: str = Header(None)) -> str:
         if not authorization:
             raise HTTPException(401, "로그인이 필요합니다.")
@@ -178,8 +178,16 @@ class TemplatesEndpointTests(unittest.TestCase):
         db, _ = fake_supabase(problem=None)
         self.assertEqual(make_client(db).get("/problems/7/templates").status_code, 404)
         db, tables = fake_supabase(problem={"signature": TWO_SUM})
-        self.assertEqual(make_client(db, released=lambda _id: False).get("/problems/7/templates").status_code, 404)
+        self.assertEqual(make_client(db, released=lambda _id, _only: False).get("/problems/7/templates").status_code, 404)
         self.assertEqual(tables["test_cases"].filters, [])
+
+    def test_contest_only_flag_is_passed_to_the_release_check(self):
+        seen = []
+        db, _ = fake_supabase(problem={"signature": TWO_SUM, "contest_only": True})
+        make_client(db, released=lambda problem_id, only: seen.append((problem_id, only)) or True).get("/problems/7/templates")
+        db, _ = fake_supabase(problem={"signature": TWO_SUM})
+        make_client(db, released=lambda problem_id, only: seen.append((problem_id, only)) or True).get("/problems/8/templates")
+        self.assertEqual(seen, [(7, True), (8, False)])
 
     def test_database_failure_is_unavailable(self):
         db, _ = fake_supabase(problem={"signature": TWO_SUM}, error=RuntimeError("down"))

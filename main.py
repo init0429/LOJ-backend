@@ -39,17 +39,45 @@ def required_env(name: str) -> str:
 
 supabase: Client = create_client(required_env("SUPABASE_URL"), required_env("SUPABASE_KEY"))
 
+# 끝난 대회의 대회 전용 문제를 공개하는 주기(초). DB 함수가 대회가 끝나고 2분 뒤부터 옮기므로
+# 대회가 끝나고 2분 반쯤 안에 문제 목록에 나온다.
+PUBLISH_INTERVAL = 30
+
+
+async def publish_contest_problems_forever():
+    """
+    대회 전용 문제를 공개한다(migrations/20261120_contest_only_problems.sql의 publish_contest_problems()).
+    번호를 정하고 옮기는 일은 DB 함수가 한 트랜잭션으로 하므로, 여기서는 주기적으로 부르기만 한다.
+    API 프로세스가 여럿이어도 DB 함수가 표를 잠그고 이미 옮긴 문제는 건너뛰므로 겹치지 않는다.
+    """
+    failing = False
+    while True:
+        try:
+            result = await run_in_threadpool(lambda: supabase.rpc("publish_contest_problems").execute())
+            if result.data:
+                logger.info("대회 전용 문제 %s개를 공개했습니다.", result.data)
+            failing = False
+        except Exception:
+            # 마이그레이션 전이면 함수가 없다. 같은 실패를 30초마다 남기지 않도록 처음 한 번만 남긴다.
+            if not failing:
+                logger.exception("대회 전용 문제를 공개하지 못했습니다.")
+            failing = True
+        await asyncio.sleep(PUBLISH_INTERVAL)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI):
+    tasks = [asyncio.create_task(publish_contest_problems_forever())]
     # solved.ac 연동 사용자의 통계를 밤마다 받는다(recommend.Recommender.run_nightly).
-    nightly = asyncio.create_task(recommender.run_nightly()) if recommender.can_sync else None
+    if recommender.can_sync:
+        tasks.append(asyncio.create_task(recommender.run_nightly()))
     try:
         yield
     finally:
-        if nightly is not None:
-            nightly.cancel()
+        for task in tasks:
+            task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await nightly
+                await task
 
 
 app = FastAPI(title="LOJ Backend API", version="1.0.0", lifespan=lifespan)
@@ -261,8 +289,12 @@ def parse_time(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def problem_released(problem_id: int) -> bool:
-    """아직 시작하지 않은 대회에 든 문제가 아닌지. DB의 problem_is_released()와 같은 기준이다."""
+def problem_released(problem_id: int, contest_only: bool = False) -> bool:
+    """
+    누구나 읽을 수 있는 문제인지. DB의 problem_is_released()와 같은 기준이다.
+    - 아직 시작하지 않은 대회에 든 문제는 숨긴다.
+    - 대회 전용 문제는 시작한 대회에 들어 있어야 한다(대회 화면에서만 푼다).
+    """
     links = (
         supabase.table("contest_problems")
         .select("contests(start_time)")
@@ -270,11 +302,10 @@ def problem_released(problem_id: int) -> bool:
         .execute()
     )
     now = datetime.now(timezone.utc)
-    return not any(
-        parse_time(row["contests"]["start_time"]) > now
-        for row in links.data or []
-        if row.get("contests")
-    )
+    starts = [parse_time(row["contests"]["start_time"]) for row in links.data or [] if row.get("contests")]
+    if any(start > now for start in starts):
+        return False
+    return not contest_only or any(start <= now for start in starts)
 
 
 def validate_judging_context(submission: Submission, public_only: bool = False):
@@ -284,12 +315,15 @@ def validate_judging_context(submission: Submission, public_only: bool = False):
     함수 구현으로 내면 문제의 시그니처(DB에 저장된 그대로)를 돌려준다.
     """
     try:
-        # 시그니처는 함수 구현일 때만 읽는다. 마이그레이션 전에도 일반 제출은 그대로 된다.
-        columns = "id, signature" if submission.mode == "function" else "id"
-        problem = supabase.table("problems").select(columns).eq("id", submission.problem_id).execute()
+        # 칸을 골라 읽지 않고 *로 읽는다. 마이그레이션 전이라 signature나 contest_only 칸이 없어도
+        # 일반 제출은 그대로 된다.
+        problem = supabase.table("problems").select("*").eq("id", submission.problem_id).execute()
         if not problem.data:
             raise HTTPException(404, "문제를 찾을 수 없습니다.")
         if submission.contest_id is None:
+            # 대회 전용 문제는 대회가 끝나 문제 목록에 공개되기 전까지 대회 밖에서 풀 수 없다.
+            if problem.data[0].get("contest_only"):
+                raise HTTPException(404, "대회가 끝나면 문제 목록에 공개되는 문제입니다. 대회 화면에서 풀어 주세요.")
             # 아직 시작하지 않은 대회의 문제는 대회 밖에서 실행하거나 제출할 수 없다. 예제 실행은
             # 예제 입출력을 돌려주므로, 막지 않으면 문제 번호만으로 대회 전에 예제를 볼 수 있다.
             # (브라우저에서 직접 읽는 길은 DB의 RLS가 막는다.)
@@ -322,7 +356,7 @@ def validate_judging_context(submission: Submission, public_only: bool = False):
 # 함수형 문제: 푸는 화면의 시작 코드와 관리자 화면의 시그니처 도구
 app.include_router(function_problems.create_router(
     supabase=supabase, current_user=get_current_user_id,
-    released=lambda problem_id: problem_released(problem_id),
+    released=lambda problem_id, contest_only: problem_released(problem_id, contest_only),
 ))
 
 

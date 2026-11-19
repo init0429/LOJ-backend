@@ -281,11 +281,18 @@ class Recommender:
                 start += PAGE
 
         submissions = all_rows(lambda: db.table("submissions").select("problem_id, status").eq("user_id", user_id).order("id"))
-        try:
-            raw = all_rows(lambda: db.table("problems").select("id, title, difficulty, solvedac_tier, problem_tags(tag_key)").order("id"))
-        except Exception:
-            # 태그 마이그레이션 전이면 티어와 태그 없이 추천한다.
-            raw = all_rows(lambda: db.table("problems").select("id, title, difficulty").order("id"))
+        # 마이그레이션 전이면 없는 칸을 빼고 다시 읽는다(대회 전용 표시 → 티어와 태그 순으로).
+        for columns in (
+            "id, title, difficulty, solvedac_tier, contest_only, problem_tags(tag_key)",
+            "id, title, difficulty, solvedac_tier, problem_tags(tag_key)",
+            "id, title, difficulty",
+        ):
+            try:
+                raw = all_rows(lambda: db.table("problems").select(columns).order("id"))
+                break
+            except Exception:
+                if columns == "id, title, difficulty":
+                    raise
         # 아직 끝나지 않은 대회의 문제는 추천하지 않는다. 시작 전이면 공개 전이고, 진행 중이면
         # 추천 화면의 태그가 대회 참가자에게 풀이 힌트가 된다.
         now = datetime.now(timezone.utc)
@@ -303,7 +310,8 @@ class Recommender:
                 "tags": [tag["tag_key"] for tag in row.get("problem_tags") or []],
             }
             for row in raw
-            if row["id"] not in hidden
+            # 대회 전용 문제는 대회가 끝나 공개될 때(contest_only가 false가 될 때)까지 추천하지 않는다.
+            if row["id"] not in hidden and not row.get("contest_only")
         ]
         try:
             names = {row["key"]: row["name_ko"] for row in db.table("tags").select("key, name_ko").execute().data or []}

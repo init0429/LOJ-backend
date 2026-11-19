@@ -152,8 +152,8 @@ def parse_body_signature(raw: dict) -> Signature:
         raise HTTPException(422, str(error))
 
 
-def create_router(*, supabase, current_user: Callable, released: Callable[[int], bool]) -> APIRouter:
-    """released(problem_id): 공개된 문제인지(시작 전 대회의 문제가 아닌지)"""
+def create_router(*, supabase, current_user: Callable, released: Callable[[int, bool], bool]) -> APIRouter:
+    """released(problem_id, contest_only): 누구나 읽을 수 있는 문제인지(main.problem_released)"""
     router = APIRouter()
 
     def is_admin(user_id: str) -> bool:
@@ -172,8 +172,9 @@ def create_router(*, supabase, current_user: Callable, released: Callable[[int],
 
     def load_templates(problem_id: int) -> dict:
         try:
-            rows = supabase.table("problems").select("signature").eq("id", problem_id).execute().data
-            if not rows or not released(problem_id):
+            # *로 읽어 마이그레이션 전(contest_only 칸이 없을 때)에도 동작하게 한다.
+            rows = supabase.table("problems").select("*").eq("id", problem_id).execute().data
+            if not rows or not released(problem_id, bool(rows[0].get("contest_only"))):
                 raise HTTPException(404, "문제를 찾을 수 없습니다.")
             sig = stored_signature(rows[0].get("signature"))
             if sig is None:
